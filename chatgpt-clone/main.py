@@ -1,7 +1,4 @@
 import dotenv
-from numpy.char import center
-from openai.types.responses.response_output_message import Content
-from streamlit.elements.lib.layout_utils import TextAlignment
 dotenv.load_dotenv()
 from openai import OpenAI
 import asyncio
@@ -72,7 +69,7 @@ st.markdown("""
         padding: 10px 0;
     }
     .main-content {
-        margin-top: 180px; /* 상단 바 높이만큼 여백을 주어 내용이 겹치지 않게 함 */
+        margin-top: 50px; /* 상단 바 높이만큼 여백을 주어 내용이 겹치지 않게 함 */
     }
     </style>
     """, unsafe_allow_html=True)
@@ -146,7 +143,7 @@ async def paint_history():
     for message in messages:
 
         # 1. 메시지 역할(role) 확인
-        role = message["role"]
+        role = message.get("role")
 
         # [필터링] 'system' 역할은 AI 내부 지침용이므로 화면에 그리지 않음
         if role == "system":

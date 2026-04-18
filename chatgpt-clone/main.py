@@ -1,5 +1,4 @@
 import dotenv
-from pandas.core.indexes.base import common_dtype_categorical_compat
 dotenv.load_dotenv()
 from openai import OpenAI
 import asyncio
@@ -22,70 +21,6 @@ client = OpenAI()
 
 VECTOR_STORE_ID = "vs_69de7b79381c8191a7e28b77fa8005e9"
 
-if "agent" not in st.session_state:
-
-    st.session_state["agent"] = Agent(
-        name="Life Coach Agent",
-        instructions="""
-
-        You are a helpful assistant.
-
-        You have access to the followign tools:
-            - Web Search Tool: Use this when the user asks a questions that isn't in your training data. Use this tool when the users asks about current or future events, when you think you don't know the answer, try searching for it in the web first.
-            - File Search Tool: Use this tool when the user asks a question about facts related to themselves. Or when they ask questions about specific files.
-            - Code Interpreter Tool: Use this tool when you need to write and run code to answer the user's question.
-
-
-            # You are a strategic Life Coach AI. Your goal is to help the user achieve the specific goals outlined in their uploaded documents.
-
-            # Core Responsibilities:
-            # 1. Contextual Awareness: Always check the user's uploaded "Personal Goal" files using the File Search Tool to ensure your advice aligns with their long-term vision.
-            # 2. Continuity: Reference previous conversations (Chat History) to track progress. If the user mentioned a challenge yesterday, follow up on it today.
-            # 3. Progress Tracking: Periodically summarize the user's journey. Use phrases like "Since you achieved X last week, let's aim for Y today."
-            # 4. Proactive Coaching: If the user's current input contradicts their uploaded goals, gently point it out and ask for clarification.
-
-            # Tools:
-            # - File Search Tool: Use this to retrieve details from the "Personal Goal" documents.
-            # - Web Search Tool: Use this for external research, habit science, or motivational content.
-            # - Code Interpreter Tool: Use this tool when you need to write and run code to answer the user's question.
-            """,
-        tools=[
-            WebSearchTool(),
-            FileSearchTool(
-                vector_store_ids=[VECTOR_STORE_ID],
-                max_num_results=3,
-            ),
-            ImageGenerationTool(
-                tool_config={
-                    "type": "image_generation",
-                    "quality": "high",
-                    "output_format": "jpeg",
-                    "moderation": "low",
-                    "partial_images": 1,
-                }
-            ),
-            CodeInterpreterTool(
-                tool_config={
-                    "type": "code_interpreter",
-                    "container": {
-                        "type": "auto",
-                    },
-                }
-            ),
-            HostedMCPTool(
-                tool_config={
-                    "server_url" : "https://mcp.context7.com/mcp",
-                    "type": "mcp",
-                    "server_label": "Context7",
-                    "server_description": "Use this to get the docs from software projects.",
-                    "require_approval": "never",
-                }
-            )
-        ],
-    )
-
-
-agent = st.session_state["agent"]
 
 if "session" not in st.session_state:
     st.session_state["session"] = SQLiteSession(
@@ -246,39 +181,99 @@ def update_status(status_container, event):
 
 
 async def run_agent(message):
-    with st.chat_message("ai"):
-        status_container = st.status("⏳", expanded=False)
-        image_placeholder = st.empty()
-        code_placeholder = st.empty()
-        text_placeholder = st.empty()
-        response = ""
-        code_response = ""
 
-        st.session_state["code_placeholder"] = code_placeholder
-        st.session_state["image_placeholder"] = image_placeholder
-        st.session_state["text_placeholder"] = text_placeholder
+    yfinance_server = MCPServerStdio(
+        params={
+            "command": "uvx",
+            "args": ["mcp-yahoo-finance"] 
+        },
+        cache_tools_list=True,
+        client_session_timeout_seconds = 60, 
+    )
 
-        stream = Runner.run_streamed(
-            agent, 
-            message, 
-            session=session,)
+    async with yfinance_server:
+        agent = Agent(
+            mcp_servers=[
+                yfinance_server,
+            ],
+            name="ChatGPT Clone",
+            instructions="""
+            You are a helpful assistant.
 
-        async for event in stream.stream_events():
-            if event.type == "raw_response_event":
+            You have access to the followign tools:
+                - Web Search Tool: Use this when the user asks a questions that isn't in your training data. Use this tool when the users asks about current or future events, when you think you don't know the answer, try searching for it in the web first.
+                - File Search Tool: Use this tool when the user asks a question about facts related to themselves. Or when they ask questions about specific files.
+                - Code Interpreter Tool: Use this tool when you need to write and run code to answer the user's question.
 
-                update_status(status_container, event.data.type)
-                
-                if event.data.type == "response.output_text.delta":
-                    response += event.data.delta
-                    text_placeholder.write(response.replace("$", "\\$"))
+                """,
+                tools=[
+                    WebSearchTool(),
+                    FileSearchTool(
+                        vector_store_ids=[VECTOR_STORE_ID],
+                        max_num_results=3,
+                    ),
+                    ImageGenerationTool(
+                        tool_config={
+                            "type": "image_generation",
+                            "quality": "high",
+                            "output_format": "jpeg",
+                            "moderation": "low",
+                            "partial_images": 1,
+                        }
+                    ),
+                    CodeInterpreterTool(
+                        tool_config={
+                            "type": "code_interpreter",
+                            "container": {
+                                "type": "auto",
+                            },
+                        }
+                    ),
+                    HostedMCPTool(
+                        tool_config={
+                            "server_url" : "https://mcp.context7.com/mcp",
+                            "type": "mcp",
+                            "server_label": "Context7",
+                            "server_description": "Use this to get the docs from software projects.",
+                            "require_approval": "never",
+                        }
+                    )
+                ],
+            )
 
-                if event.data.type == "response.code_interpreter_call_code.delta":
-                    code_response += event.data.delta
-                    code_placeholder.code(code_response)
+        with st.chat_message("ai"):
+            status_container = st.status("⏳", expanded=False)
+            image_placeholder = st.empty()
+            code_placeholder = st.empty()
+            text_placeholder = st.empty()
+            response = ""
+            code_response = ""
 
-                elif event.data.type == "response.image_generation_call.partial_image": 
-                    image = base64.b64decode(event.data.partial_image_b64)
-                    image_placeholder.image(image)
+            st.session_state["code_placeholder"] = code_placeholder
+            st.session_state["image_placeholder"] = image_placeholder
+            st.session_state["text_placeholder"] = text_placeholder
+
+            stream = Runner.run_streamed(
+                agent, 
+                message, 
+                session=session,)
+
+            async for event in stream.stream_events():
+                if event.type == "raw_response_event":
+
+                    update_status(status_container, event.data.type)
+                    
+                    if event.data.type == "response.output_text.delta":
+                        response += event.data.delta
+                        text_placeholder.write(response.replace("$", "\\$"))
+
+                    if event.data.type == "response.code_interpreter_call_code.delta":
+                        code_response += event.data.delta
+                        code_placeholder.code(code_response)
+
+                    elif event.data.type == "response.image_generation_call.partial_image": 
+                        image = base64.b64decode(event.data.partial_image_b64)
+                        image_placeholder.image(image)
                 
 
 prompt = st.chat_input(

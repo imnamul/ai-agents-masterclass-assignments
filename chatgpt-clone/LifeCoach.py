@@ -32,8 +32,48 @@ if "session" not in st.session_state:
 session = st.session_state["session"]
 
 
+# ── 세션 데이터 정리 (이전 스키마 호환) ─────────────────────
+def _remove_action_fields(value):
+    if isinstance(value, dict):
+        cleaned = {}
+        changed = False
+        for key, item in value.items():
+            if key == "action":
+                changed = True
+                continue
+            next_item, item_changed = _remove_action_fields(item)
+            cleaned[key] = next_item
+            changed = changed or item_changed
+        return cleaned, changed
+    if isinstance(value, list):
+        cleaned_list = []
+        changed = False
+        for item in value:
+            next_item, item_changed = _remove_action_fields(item)
+            cleaned_list.append(next_item)
+            changed = changed or item_changed
+        return cleaned_list, changed
+    return value, False
+
+
+async def sanitize_session_items():
+    items = await session.get_items()
+    cleaned_items = []
+    changed = False
+
+    for item in items:
+        cleaned_item, item_changed = _remove_action_fields(item)
+        cleaned_items.append(cleaned_item)
+        changed = changed or item_changed
+
+    if changed:
+        await session.clear_session()
+        await session.add_items(cleaned_items)
+
+
 # ── 대화 기록 렌더링 ─────────────────────────────────────
 async def paint_history():
+    await sanitize_session_items()
     messages = await session.get_items()
 
     for message in messages:

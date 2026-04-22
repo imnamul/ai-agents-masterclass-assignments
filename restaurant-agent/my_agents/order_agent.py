@@ -1,5 +1,6 @@
 from agents import Agent, RunContextWrapper
 from models import RestaurantContext
+from output_guardrails import order_output_guardrail, response_quality_output_guardrail
 
 def dynamic_order_agent_instructions(
     wrapper: RunContextWrapper[RestaurantContext],
@@ -27,6 +28,14 @@ def dynamic_order_agent_instructions(
     - If an item is unavailable, apologise and suggest the closest alternative
     - Be efficient and friendly
  
+    HANDOFF RULES:
+    - Handle requests in your domain.
+    - If request belongs to another domain, hand off to the right agent (Menu/Order/Reservation/Complaints).
+    - If intent is mixed or unclear, hand off to TRIAGE AGENT.
+    - Do not deeply answer outside your domain before handoff.
+    - Perform at most ONE handoff per turn.
+    - Before handoff, say briefly in Korean: "적합한 담당자에게 연결해 드릴게요."
+
     Customer: {wrapper.context.customer_name or "손님"}, Table/Order: {wrapper.context.table_or_order_id or "미배정"}
     """
 
@@ -35,4 +44,6 @@ order_agent = Agent(
     name="order_agent",
     instructions=dynamic_order_agent_instructions,
     handoff_description="주문 접수, 수정, 취소, 주문 현황 확인을 처리합니다.",
+    #output_guardrails=[order_output_guardrail],
+    output_guardrails=[response_quality_output_guardrail],
 )

@@ -10,10 +10,6 @@ from agents import (
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from agents.extensions import handoff_filters
 from models import RestaurantContext, InputGuardRailOutput, HandoffData
-from my_agents.menu_agent import menu_agent
-from my_agents.order_agent import order_agent
-from my_agents.reservation_agent import reservation_agent
-
 
 
 input_guardrail_agent = Agent(
@@ -74,6 +70,7 @@ def dynamic_triage_agent_instrcutions(
     Greet the customer warmly. If their name is known, use it: {wrapper.context.customer_name or "손님"}.
  
     YOUR ONLY JOB: Understand what the customer needs and route them to the right specialist.
+    If the customer expresses dissatisfaction, complaint, refund demand, or asks for a manager, prioritize COMPLAINTS AGENT.
     Never answer menu, order, or reservation questions yourself — always hand off.
  
     ROUTING GUIDE:
@@ -94,6 +91,13 @@ def dynamic_triage_agent_instrcutions(
     - Modifying or cancelling a reservation
     - Availability inquiries ("금요일에 4명 자리 있나요?")
     - Special seating requests
+
+    😟 COMPLAINTS AGENT — Route here for:
+    - 서비스 불만 (직원 응대, 대기시간, 주문 누락/지연)
+    - 음식 품질 불만 (맛, 온도, 이물감 등)
+    - 결제/청구 관련 불만
+    - 환불, 할인, 매니저 연결 요청
+    - 심각한 이슈(식품 안전, 차별/안전 문제, 법적 분쟁 가능성)
  
     ROUTING PROCESS:
     1. Listen to the customer's request
@@ -102,6 +106,7 @@ def dynamic_triage_agent_instrcutions(
        - 메뉴 문의: "메뉴 전문가에게 연결해 드릴게요..."
        - 주문: "주문 담당에게 연결해 드릴게요..."
        - 예약: "예약 담당에게 연결해 드릴게요..."
+       - 불만 접수: "불편을 드려 죄송합니다. 고객 케어 담당자에게 바로 연결해 드릴게요..."
     4. Then immediately transfer to the appropriate agent
     """
  
@@ -144,10 +149,5 @@ triage_agent = Agent(
     #         tool_name="Technical Help Tool",
     #         tool_description="Use this when the user needs tech support."
     #     )
-    # ]
-    handoffs=[
-        make_handoff(menu_agent),
-        make_handoff(order_agent),
-        make_handoff(reservation_agent),
-    ],
+    # ],
 )

@@ -10,7 +10,10 @@ from agents import (
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from agents.extensions import handoff_filters
 from models import RestaurantContext, InputGuardRailOutput, HandoffData
-
+from my_agents.menu_agent import menu_agent
+from my_agents.order_agent import order_agent
+from my_agents.reservation_agent import reservation_agent
+from my_agents.complaints_agent import complaints_agent
 
 input_guardrail_agent = Agent(
     name="Input Guardrail Agent",
@@ -100,14 +103,25 @@ def dynamic_triage_agent_instrcutions(
     - 심각한 이슈(식품 안전, 차별/안전 문제, 법적 분쟁 가능성)
  
     ROUTING PROCESS:
-    1. Listen to the customer's request
-    2. If truly unclear, ask ONE clarifying question
-    3. Announce the handoff clearly in Korean:
-       - 메뉴 문의: "메뉴 전문가에게 연결해 드릴게요..."
-       - 주문: "주문 담당에게 연결해 드릴게요..."
-       - 예약: "예약 담당에게 연결해 드릴게요..."
-       - 불만 접수: "불편을 드려 죄송합니다. 고객 케어 담당자에게 바로 연결해 드릴게요..."
-    4. Then immediately transfer to the appropriate agent
+    1. Identify the user's primary intent.
+    2. If the request is unclear, ask ONE concise clarifying question.
+    3. If the request comes from a specialist handoff, re-triage it from scratch and select the best next agent.
+    4. Treat TRIAGE as the single routing hub:
+    - Specialists must not route directly to other specialists.
+    - Cross-domain transitions must always pass through TRIAGE.
+    5. If intent is mixed (e.g., menu + order), choose one primary intent first, hand off once, and mention the remaining intent can be handled next.
+    6. Announce the handoff clearly in Korean:
+    - Menu: "메뉴 전문가에게 연결해 드릴게요..."
+    - Order: "주문 담당에게 연결해 드릴게요..."
+    - Reservation: "예약 담당에게 연결해 드릴게요..."
+    - Complaints: "불편을 드려 죄송합니다. 고객 케어 담당자에게 바로 연결해 드릴게요..."
+    7. Perform at most ONE handoff per turn, then stop routing.
+
+    When performing a handoff, you MUST provide a JSON object with these fields:
+    - to_agent_name: name of the target agent (string)
+    - reason: why you are handing off (string)
+    - issue_type: one of ["menu", "order", "reservation", "complaints"]
+    - issue_description: brief summary of the customer's issue (string)
     """
  
 def handle_handoff(
@@ -116,15 +130,14 @@ def handle_handoff(
 ):
 
     with st.sidebar:
-        st.write(
+        st.subheader("🤖 Handoff")
+        st.markdown(
             f"""
-            Handling off to {input_data.to_agent_name}
-            Reason: {input_data.reason}
-            Issue Type: {input_data.issue_type}
-            Description: {input_data.issue_description}
+        - Reason: {input_data.reason}
+        - Issue Type: {input_data.issue_type}
+        - Description: {input_data.issue_description}
         """
         )
-
 
 def make_handoff(agent):
 
@@ -150,4 +163,11 @@ triage_agent = Agent(
     #         tool_description="Use this when the user needs tech support."
     #     )
     # ],
+    # triage -> specialists
+    handoffs = [
+        make_handoff(menu_agent),
+        make_handoff(order_agent),
+        make_handoff(reservation_agent),
+        make_handoff(complaints_agent),
+    ],
 )

@@ -9,11 +9,13 @@ from ..callbacks import on_assembly_done
 
 MODEL = LiteLlm(model="openai/gpt-4o")
 
-_BANNER_HEIGHT = 220
+_BANNER_HEIGHT = 240   # height of the bottom text banner on story pages
 _PADDING = 16
-_PAGE_NUM_AREA = 32
-_TEXT_SIZE = 28
-_NUM_SIZE = 22
+_PAGE_NUM_AREA = 50   # vertical strip reserved for the page number (moves it up from edge)
+_TEXT_SIZE = 32       # story narration font size
+_NUM_SIZE = 22        # page number font size
+_TITLE_BANNER_HEIGHT = 200  # height of the top banner on the title/cover page
+_TITLE_SIZE = 54      # book title font size
 
 
 def _get_font(size: int):
@@ -60,10 +62,61 @@ async def assemble_book(tool_context: ToolContext) -> dict:
         return {"status": "error", "message": "No pages found in story_output."}
 
     existing = await tool_context.list_artifacts()
-    text_font = _get_font(_TEXT_SIZE)
-    num_font = _get_font(_NUM_SIZE)
+    text_font  = _get_font(_TEXT_SIZE)
+    num_font   = _get_font(_NUM_SIZE)
+    title_font = _get_font(_TITLE_SIZE)
     results = []
 
+    # ── Title / cover page (page_00) ──────────────────────────────────────
+    title = (
+        story_output.get("title", "")
+        if isinstance(story_output, dict)
+        else getattr(story_output, "title", "")
+    )
+    src_title = "page_00.jpeg"
+    dst_title = "final_page_00.jpeg"
+
+    if dst_title in existing:
+        results.append({"page_number": 0, "filename": dst_title, "skipped": True})
+    elif src_title not in existing:
+        results.append({"page_number": 0, "error": f"{src_title} not found"})
+    else:
+        src_artifact = await tool_context.load_artifact(src_title)
+        img = Image.open(io.BytesIO(src_artifact.inline_data.data)).convert("RGBA")
+        w, h = img.size
+
+        # Semi-transparent band across the TOP of the cover
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(overlay).rectangle(
+            [(0, 0), (w, _TITLE_BANNER_HEIGHT)], fill=(0, 0, 0, 185)
+        )
+        img = Image.alpha_composite(img, overlay)
+        draw = ImageDraw.Draw(img)
+
+        # Book title centered inside the top band
+        if title:
+            lines = _wrap(draw, title, title_font, w - _PADDING * 2)
+            line_h = _TITLE_SIZE + 8
+            text_block_h = len(lines) * line_h
+            ty = (_TITLE_BANNER_HEIGHT - text_block_h) // 2
+            for line in lines:
+                lw = draw.textbbox((0, 0), line, font=title_font)[2]
+                x = (w - lw) // 2
+                draw.text((x + 2, ty + 2), line, font=title_font, fill=(0, 0, 0, 180))
+                draw.text((x, ty),         line, font=title_font, fill=(255, 255, 255, 255))
+                ty += line_h
+
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=90)
+        await tool_context.save_artifact(
+            filename=dst_title,
+            artifact=types.Part(
+                inline_data=types.Blob(mime_type="image/jpeg", data=buf.getvalue())
+            ),
+        )
+        results.append({"page_number": 0, "filename": dst_title, "skipped": False})
+
+    # ── Story pages (page_01 – page_05) ──────────────────────────────────
     for page in pages:
         page_number = int(page["page_number"])
         src = f"page_{page_number:02d}.jpeg"
@@ -133,8 +186,9 @@ book_assembler_agent = Agent(
     description="Overlays narration text and page numbers onto each illustrated page and saves the final book",
     instruction="""
     You are a book layout artist.
-    Call assemble_book once — it overlays the story text and page number onto every page image
-    and saves the results as final_page_01.jpeg through final_page_05.jpeg.
+    Call assemble_book once — it overlays the book title onto the cover page and the story text
+    and page number onto every story page, saving the results as
+    final_page_00.jpeg (cover) through final_page_05.jpeg.
 
     After the tool returns, report:
     - Total pages assembled

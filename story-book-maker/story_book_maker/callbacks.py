@@ -4,10 +4,11 @@ from google.adk.models import LlmResponse
 from google.genai import types
 
 
-def _make_content(text: str) -> Optional[LlmResponse]:
+def _make_content(text: str) -> LlmResponse:
     """
-    Helper that wraps a text message into an LlmResponse,
-    which ADK renders as a chat message in the Web UI.
+    Wraps a text message into an LlmResponse.
+    ADK renders this as a chat message in the Web UI when returned from
+    after_agent_callback.
     """
     return LlmResponse(
         content=types.Content(
@@ -17,49 +18,32 @@ def _make_content(text: str) -> Optional[LlmResponse]:
     )
 
 
-def on_pipeline_start(callback_context: CallbackContext) -> Optional[LlmResponse]:
-    """Fires when the full pipeline starts."""
-    theme = callback_context.state.get("theme", "")
-    print(f"🚀 Starting the pipeline! Theme: **{theme}**")
-    return None
-
+# ── Pipeline-level ────────────────────────────────────────────────────────────
 
 def on_pipeline_done(callback_context: CallbackContext) -> Optional[LlmResponse]:
-    """Fires when the full pipeline completes."""
+    """Fires when the full pipeline completes (after_agent_callback)."""
     return _make_content("🎉 Pipeline complete! Your picture book is ready.")
 
 
-def on_story_writing_start(callback_context: CallbackContext) -> Optional[LlmResponse]:
-    """Fires when the story writer agent starts."""
-    print("📖 Writing the story...")
-    return None
-
+# ── Story writer ──────────────────────────────────────────────────────────────
 
 def on_story_writing_done(callback_context: CallbackContext) -> Optional[LlmResponse]:
-    """Fires when the story writer agent finishes."""
+    """Fires when the story writer agent finishes (after_agent_callback)."""
     return _make_content("✅ Story writing complete!")
 
 
-def make_page_illustration_start(page_number: int):
-    """Returns a callback that fires when a specific page illustrator starts."""
-    def callback(callback_context: CallbackContext) -> Optional[LlmResponse]:
-        print(f"🎨 Generating image {page_number}/5...")
-        return None
-    return callback
-
+# ── Illustrator ───────────────────────────────────────────────────────────────
 
 def make_page_illustration_done(page_number: int):
-    """Returns a callback that fires when a specific page illustrator finishes."""
+    """Returns an after_agent_callback that fires when a page illustrator finishes."""
     def callback(callback_context: CallbackContext) -> Optional[LlmResponse]:
-        return _make_content(f"✅ Image {page_number}/5 saved.")
+        label = "Title page" if page_number == 0 else f"Image {page_number}/5"
+        return _make_content(f"✅ {label} saved.")
     return callback
 
 
-def on_assembly_start(callback_context: CallbackContext) -> Optional[LlmResponse]:
-    """Fires when the book assembler agent starts."""
-    print("📚 Assembling the final book...")
-    return None
+# ── Book assembler ────────────────────────────────────────────────────────────
 
 def on_assembly_done(callback_context: CallbackContext) -> Optional[LlmResponse]:
-    """Fires when the book assembler agent finishes."""
-    return _make_content("🎉 Picture book assembly complete!")
+    """Fires when the book assembler agent finishes (after_agent_callback)."""
+    return _make_content("📚 Picture book assembly complete!")

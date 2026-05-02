@@ -1,5 +1,7 @@
 from google.adk.agents import Agent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
+from google.adk.agents.callback_context import CallbackContext
+from google.genai import types
 from .story_writer.agent import story_writer_agent
 from .illustrator.agent import illustrator_agent
 from .book_assembler.agent import book_assembler_agent
@@ -8,13 +10,38 @@ from .callbacks import on_pipeline_done
 MODEL = LiteLlm(model="openai/gpt-4o")
 
 
+def _status_agent(name: str, text: str) -> Agent:
+    """
+    Creates a no-op agent whose sole job is to emit one status line in ADK Web.
+
+    How it works:
+      - before_agent_callback returns types.Content → ADK emits the event in the
+        Web UI, then sets end_invocation=True and skips this agent's body.
+      - That is harmless because the agent has no real work to do.
+      - SequentialAgent does NOT check end_invocation between sub-agents, so the
+        next real sub-agent runs normally.
+    """
+    def _announce(callback_context: CallbackContext) -> types.Content:
+        return types.Content(role="model", parts=[types.Part(text=text)])
+
+    return Agent(
+        name=name,
+        model=MODEL,
+        description=f"Status announcer: {text}",
+        before_agent_callback=_announce,
+    )
+
+
 # Step 1~3 pipeline — executes after theme is confirmed by the user
 pipeline_agent = SequentialAgent(
     name="story_book_maker_pipeline",
     description="Given a theme, writes a story, illustrates all pages, then assembles the final book",
     sub_agents=[
+        _status_agent("announce_story_writing",  "📖 Writing the story…"),
         story_writer_agent,           # Step 1: write the story
+        _status_agent("announce_illustrating",   "🎨 Generating illustrations for all 5 pages…"),
         illustrator_agent,            # Step 2: generate all 5 images
+        _status_agent("announce_assembly",       "📚 Assembling the final book…"),
         book_assembler_agent,         # Step 3: overlay text + page numbers
     ],
     after_agent_callback=on_pipeline_done,

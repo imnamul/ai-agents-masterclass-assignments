@@ -5,6 +5,7 @@ from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types
+from ..callbacks import on_assembly_done
 
 MODEL = LiteLlm(model="openai/gpt-4o")
 
@@ -141,4 +142,5 @@ book_assembler_agent = Agent(
     - Any pages that were skipped or failed
     """,
     tools=[assemble_book_tool],
+    after_agent_callback=on_assembly_done,
 )

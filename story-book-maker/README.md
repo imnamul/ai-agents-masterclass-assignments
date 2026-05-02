@@ -1,35 +1,63 @@
+# Story Book Maker
+
+A multi-agent pipeline that generates an illustrated children's picture book from a user-provided theme.
+
+## Project Structure
+
+```
 story_book_maker/
-├── .env
-├── agent.py                    # root_agent = SequentialAgent
-├── callbacks.py                # Progress callbacks
+├── .env                          # OPENAI_API_KEY
+├── agent.py                      # root_agent (LlmAgent) + pipeline_agent (SequentialAgent)
+├── callbacks.py                  # after_agent progress callbacks
 ├── story_writer/
-│   ├── __init__.py
-│   └── agent.py
+│   └── agent.py                  # Writes 5-page story → state["story_output"]
 ├── illustrator/
-│   ├── __init__.py
-│   └── agent.py                # ParallelAgent with 5 page agents
+│   └── agent.py                  # ParallelAgent with 5 per-page illustrator agents
 └── book_assembler/
-    ├── __init__.py
-    └── agent.py                # Overlays text + page number onto each image
+    └── agent.py                  # Overlays text + page number onto each image
+```
 
+## Agent Flow
 
+```
+[User]
+  ↓
+[story_book_maker_agent]  ← root_agent (LlmAgent)
+  - Greets user, asks for theme
+  - Confirms theme before starting
+  ↓
+[story_book_maker_pipeline]  (SequentialAgent)
+  ↓
+[story_writer_agent]  (LlmAgent)
+  - Writes a 5-page story
+  - Saves structured output to state["story_output"]
+  ↓
+[illustrator_agent]  (ParallelAgent)
+  - Runs 5 page_illustrator agents simultaneously
+  - Each generates one image via OpenAI gpt-image-1
+  - Saves page_01.jpeg ~ page_05.jpeg as artifacts
+  ↓
+[book_assembler_agent]  (LlmAgent)
+  - Reads page images + story text from state
+  - Overlays narration text and page number onto each image
+  - Saves final_page_01.jpeg ~ final_page_05.jpeg as artifacts
+  ↓
+[story_book_maker_agent]
+  - Presents the completed picture book to the user
+```
 
-[User input]
-      ↓
-[SequentialAgent]  ← root_agent
-      ↓
-[Story Writer Agent]
- - Writes 5-page story
- - Saves to state["story_output"]
-      ↓
-[ParallelAgent]
- - Generates 5 images simultaneously
- - Saves as artifacts (page_01.jpeg ~ page_05.jpeg)
-      ↓
-[Book Assembler Agent]          ← NEW
- - Reads artifacts + state
- - Overlays narration text on each image
- - Adds page number to bottom center
- - Saves final pages as new artifacts (final_page_01.jpeg ~ final_page_05.jpeg)
-      ↓
-[Final output: completed picture book]
+## Setup
+
+```bash
+uv sync
+```
+
+Set `OPENAI_API_KEY` in `story_book_maker/.env`.
+
+## Run
+
+```bash
+uv run adk web
+```
+
+Open http://127.0.0.1:8000 and select `story_book_maker`.

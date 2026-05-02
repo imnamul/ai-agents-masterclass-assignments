@@ -5,6 +5,7 @@ from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types
+from ..callbacks import make_page_illustration_done
 
 MODEL = LiteLlm(model="openai/gpt-4o")
 
@@ -57,6 +58,7 @@ def _make_page_agent(page_number: int) -> Agent:
             f"for page {page_number}. Report the result."
         ),
         tools=[FunctionTool(func=_generate)],
+        after_agent_callback=make_page_illustration_done(page_number),
     )
 
 

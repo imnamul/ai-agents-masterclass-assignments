@@ -1,4 +1,5 @@
 import io
+import re
 from PIL import Image, ImageDraw, ImageFont
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
@@ -56,7 +57,7 @@ def _wrap(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[st
 async def assemble_book(tool_context: ToolContext) -> dict:
     """
     Loads each page_XX.jpeg artifact, overlays the narration text and page number,
-    and saves the result as final_page_XX.jpeg.
+    saves the result as final_page_XX.jpeg, and bundles all pages into storybook.pdf.
     """
     raw = tool_context.state.get("story_output")
     if not raw:
@@ -75,6 +76,7 @@ async def assemble_book(tool_context: ToolContext) -> dict:
     num_font   = _get_font(_NUM_SIZE)
     title_font = _get_font(_TITLE_SIZE)
     results = []
+    pdf_images: list[Image.Image] = []   # RGB images collected for PDF (cover first)
 
     # ── 표지 (page_00) ────────────────────────────────────────────────────
     title = story.get("title", "")
@@ -82,6 +84,9 @@ async def assemble_book(tool_context: ToolContext) -> dict:
     dst_title = "final_page_00.jpeg"
 
     if dst_title in run_artifacts:
+        # Already assembled this run — load for PDF
+        art = await tool_context.load_artifact(dst_title)
+        pdf_images.append(Image.open(io.BytesIO(art.inline_data.data)).convert("RGB"))
         results.append({"page_number": 0, "filename": dst_title, "skipped": True})
     elif src_title not in existing:
         results.append({"page_number": 0, "error": f"{src_title} not found"})
@@ -109,14 +114,16 @@ async def assemble_book(tool_context: ToolContext) -> dict:
                 draw.text((x, ty),         line, font=title_font, fill=(255, 255, 255, 255))
                 ty += line_h
 
+        rgb = img.convert("RGB")
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=90)
+        rgb.save(buf, format="JPEG", quality=90)
         await tool_context.save_artifact(
             filename=dst_title,
             artifact=types.Part(
                 inline_data=types.Blob(mime_type="image/jpeg", data=buf.getvalue())
             ),
         )
+        pdf_images.append(rgb)
         run_artifacts = run_artifacts + [dst_title]
         tool_context.state["current_run_artifacts"] = run_artifacts
         results.append({"page_number": 0, "filename": dst_title, "skipped": False})
@@ -128,6 +135,9 @@ async def assemble_book(tool_context: ToolContext) -> dict:
         dst = f"final_page_{page_number:02d}.jpeg"
 
         if dst in run_artifacts:
+            # Already assembled this run — load for PDF
+            art = await tool_context.load_artifact(dst)
+            pdf_images.append(Image.open(io.BytesIO(art.inline_data.data)).convert("RGB"))
             results.append({"page_number": page_number, "filename": dst, "skipped": True})
             continue
 
@@ -166,19 +176,44 @@ async def assemble_book(tool_context: ToolContext) -> dict:
         draw.text((px + 1, py + 1), label, font=num_font, fill=(0, 0, 0, 180))
         draw.text((px, py), label, font=num_font, fill=(255, 255, 220, 255))
 
+        rgb = img.convert("RGB")
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=90)
+        rgb.save(buf, format="JPEG", quality=90)
         await tool_context.save_artifact(
             filename=dst,
             artifact=types.Part(
                 inline_data=types.Blob(mime_type="image/jpeg", data=buf.getvalue())
             ),
         )
+        pdf_images.append(rgb)
         run_artifacts = run_artifacts + [dst]
         tool_context.state["current_run_artifacts"] = run_artifacts
         results.append({"page_number": page_number, "filename": dst, "skipped": False})
 
-    return {"status": "complete", "results": results}
+    # ── PDF 번들 생성 ─────────────────────────────────────────────────────
+    safe_title = re.sub(r'[^\w가-힣]+', '_', title).strip('_')[:50]
+    pdf_filename = f"storybook_{safe_title}.pdf" if safe_title else "storybook.pdf"
+    if len(pdf_images) == len(pages) + 1:   # cover + all story pages present
+        pdf_buf = io.BytesIO()
+        pdf_images[0].save(
+            pdf_buf,
+            format="PDF",
+            save_all=True,
+            append_images=pdf_images[1:],
+            resolution=150.0,
+        )
+        await tool_context.save_artifact(
+            filename=pdf_filename,
+            artifact=types.Part(
+                inline_data=types.Blob(mime_type="application/pdf", data=pdf_buf.getvalue())
+            ),
+        )
+        run_artifacts = run_artifacts + [pdf_filename]
+        tool_context.state["current_run_artifacts"] = run_artifacts
+    else:
+        pdf_filename = None   # incomplete — skip PDF
+
+    return {"status": "complete", "results": results, "pdf": pdf_filename}
 
 
 assemble_book_tool = FunctionTool(func=assemble_book)
@@ -191,11 +226,13 @@ book_assembler_agent = Agent(
     You are a book layout artist.
     Call assemble_book once — it overlays the book title onto the cover page and the story text
     and page number onto every story page, saving the results as
-    final_page_00.jpeg (cover) through final_page_05.jpeg.
+    final_page_00.jpeg (cover) through final_page_05.jpeg, and bundling all pages into
+    a single PDF named like storybook_<book_title>.pdf.
 
     After the tool returns, report:
     - Total pages assembled
     - Filename of each final page
+    - PDF filename (e.g. storybook_용감한_아기_고양이.pdf) if successfully created
     - Any pages that were skipped or failed
     """,
     tools=[assemble_book_tool],

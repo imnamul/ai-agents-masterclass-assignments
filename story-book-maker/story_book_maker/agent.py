@@ -1,13 +1,72 @@
+from typing import Optional
+
 from google.adk.agents import Agent, SequentialAgent
-from google.adk.models.lite_llm import LiteLlm
 from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmResponse
+from google.adk.models.lite_llm import LiteLlm
 from google.genai import types
-from .story_writer.agent import story_writer_agent
-from .illustrator.agent import illustrator_agent
+
 from .book_assembler.agent import book_assembler_agent
 from .callbacks import on_pipeline_done
+from .illustrator.agent import illustrator_agent
+from .story_writer.agent import story_writer_agent
 
 MODEL = LiteLlm(model="openai/gpt-4o")
+
+
+# ── Safety net callback ────────────────────────────────────────────────────────
+
+def _ensure_pipeline_transfer(
+    callback_context: CallbackContext,
+    llm_response: LlmResponse,
+) -> Optional[LlmResponse]:
+    """
+    Safety net for same-session re-runs.
+
+    Problem: When the session context is long (e.g. a full story was already
+    generated), GPT-4o sometimes outputs only the confirmation text and stops
+    (finishReason=STOP) without calling transfer_to_agent.  ADK then waits for
+    the next user message instead of starting the pipeline.
+
+    Fix: after every LLM response for story_book_maker_agent, check whether
+    the model confirmed a theme in text but omitted the function call.  If so,
+    inject transfer_to_agent automatically so the pipeline always fires.
+    """
+    content = llm_response.content
+    if not content or not content.parts:
+        return None
+
+    # Already has a function call — nothing to do
+    if any(getattr(p, "function_call", None) for p in content.parts):
+        return None
+
+    # Only act when the text looks like a theme confirmation
+    text = "".join(getattr(p, "text", "") or "" for p in content.parts)
+    signals = [
+        "기다려 주세요",    # "please wait" in Korean
+        "만들겠습니다",     # "I will make/create"
+        "시작하겠습니다",   # "I will start"
+        "please wait",
+        "I'll create",
+        "I will create",
+    ]
+    if not any(s in text for s in signals):
+        return None
+
+    # Inject transfer_to_agent alongside the existing text parts
+    return LlmResponse(
+        content=types.Content(
+            role="model",
+            parts=list(content.parts) + [
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="transfer_to_agent",
+                        args={"agent_name": "story_book_maker_pipeline"},
+                    )
+                )
+            ],
+        )
+    )
 
 
 def _status_agent(name: str, text: str) -> Agent:
@@ -41,7 +100,7 @@ pipeline_agent = SequentialAgent(
     sub_agents=[
         _status_agent("announce_story_writing",  "📖 Writing the story…"),
         story_writer_agent,           # Step 1: write the story
-        _status_agent("announce_illustrating",   "🎨 Generating illustrations for all 5 pages…"),
+        _status_agent("announce_illustrating",   "🎨 Generating illustrations…"),
         illustrator_agent,            # Step 2: generate all 5 images
         _status_agent("announce_assembly",       "📚 Assembling the final book…"),
         book_assembler_agent,         # Step 3: overlay text + page numbers
@@ -58,19 +117,25 @@ story_book_maker_agent = Agent(
     instruction="""
     당신은 따뜻하고 창의적인 어린이 그림책 감독입니다.
 
+    ── 규칙 (반드시 준수) ──────────────────────────────────────────────────────
+    • 테마가 확정되면 확인 메시지와 transfer_to_agent 호출을 반드시 같은 턴에 수행하세요.
+      텍스트 응답만 출력하고 멈추는 것은 절대 금지입니다.
+    • 같은 세션에서 새 테마가 주어져도 동일하게 즉시 파이프라인을 호출하세요.
+    • 항상 한국어로 소통하세요. 사용자가 다른 언어를 사용하면 그 언어로 소통하세요.
+    ──────────────────────────────────────────────────────────────────────────
+
     다음 단계를 정확히 따르세요:
 
-    Step 1. 사용자가 테마를 제공하지 않은 경우, 인사 후 테마를 요청하세요.
+    Step 1. 사용자가 테마를 제공하지 않은 경우에만, 인사 후 테마를 요청하세요.
             예시: "안녕하세요! 오늘 어떤 테마로 그림책을 만들어 드릴까요?
                   (예: '용감한 아기 고양이', '불을 무서워하는 아기 용')"
 
-    Step 2. 테마가 정해지면 시작 전에 사용자에게 확인하세요.
-            예시: "'용감한 아기 고양이' 테마로 그림책을 만들겠습니다.
-                  잠시만 기다려 주세요! 📖✨"
+    Step 2. 테마가 정해지면, 아래 확인 메시지를 출력하는 즉시 story_book_maker_pipeline을
+            호출하세요. 사용자의 추가 응답을 기다리지 마세요.
+            예시 출력: "'용감한 아기 고양이' 테마로 그림책을 만들겠습니다. 잠시만 기다려 주세요! 📖✨"
+            → 이 메시지와 동시에 transfer_to_agent(story_book_maker_pipeline) 호출
 
-    Step 3. 확정된 테마를 메시지에 포함하여 story_book_maker_pipeline으로 전달하세요.
-
-    Step 4. 파이프라인이 완료되면 최종 그림책을 사용자에게 이렇게 제시하세요:
+    Step 3. 파이프라인이 완료되면 최종 그림책을 사용자에게 이렇게 제시하세요:
             - 제목
             - 표지 및 각 페이지의 텍스트
             - 각 페이지의 최종 이미지 파일명 (final_page_00.jpeg ~ final_page_05.jpeg)
@@ -81,11 +146,9 @@ story_book_maker_agent = Agent(
                   - 1페이지: ... (final_page_01.jpeg)
                   - 2페이지: ... (final_page_02.jpeg)
                   ..."
-
-    항상 한국어로 소통하세요. 사용자가 다른 언어를 사용하는 경우 해당 언어로 소통하세요.
-    Step 1을 절대 건너뛰지 마세요 — 파이프라인 시작 전에 반드시 테마를 확인하세요.
     """,
     sub_agents=[pipeline_agent],
+    after_model_callback=_ensure_pipeline_transfer,
 )
 
 root_agent = story_book_maker_agent

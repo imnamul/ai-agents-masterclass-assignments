@@ -1,8 +1,6 @@
-from typing import Optional
 from google.adk.agents import Agent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.agents.callback_context import CallbackContext
-from google.adk.models import LlmResponse
 from google.genai import types
 from .story_writer.agent import story_writer_agent
 from .illustrator.agent import illustrator_agent
@@ -34,21 +32,12 @@ def _status_agent(name: str, text: str) -> Agent:
     )
 
 
-def _reset_run_state(callback_context: CallbackContext) -> Optional[LlmResponse]:
-    """
-    Fires at the start of each pipeline run.
-    Clears the per-run artifact tracker so a second (or third…) story
-    in the same session regenerates all pages instead of being skipped.
-    """
-    callback_context.state["current_run_artifacts"] = []
-    return None
-
-
 # Step 1~3 pipeline — executes after theme is confirmed by the user
+# Note: current_run_artifacts state is reset by story_writer_agent's before_agent_callback,
+# which fires reliably on every pipeline invocation (including same-session re-runs).
 pipeline_agent = SequentialAgent(
     name="story_book_maker_pipeline",
     description="Given a theme, writes a story, illustrates all pages, then assembles the final book",
-    before_agent_callback=_reset_run_state,
     sub_agents=[
         _status_agent("announce_story_writing",  "📖 Writing the story…"),
         story_writer_agent,           # Step 1: write the story
@@ -67,34 +56,34 @@ story_book_maker_agent = Agent(
     model=MODEL,
     description="Collects a theme from the user then runs the full picture book pipeline",
     instruction="""
-    You are a warm and creative children's picture book director.
+    당신은 따뜻하고 창의적인 어린이 그림책 감독입니다.
 
-    Follow these steps exactly:
+    다음 단계를 정확히 따르세요:
 
-    Step 1. If the user has not provided a theme, greet them and ask for one.
-            Example: "Hello! What theme would you like for your picture book today?
-                      (e.g. 'a brave baby kitten', 'a little dragon who is afraid of fire')"
+    Step 1. 사용자가 테마를 제공하지 않은 경우, 인사 후 테마를 요청하세요.
+            예시: "안녕하세요! 오늘 어떤 테마로 그림책을 만들어 드릴까요?
+                  (예: '용감한 아기 고양이', '불을 무서워하는 아기 용')"
 
-    Step 2. Once you have the theme, confirm it with the user before starting.
-            Example: "Great choice! I'll create a picture book about 'a brave baby kitten'.
-                      This will take a moment — sit tight! 📖✨"
+    Step 2. 테마가 정해지면 시작 전에 사용자에게 확인하세요.
+            예시: "'용감한 아기 고양이' 테마로 그림책을 만들겠습니다.
+                  잠시만 기다려 주세요! 📖✨"
 
-    Step 3. Transfer to story_book_maker_pipeline, including the confirmed theme
-            in your message so the pipeline knows what to write about.
+    Step 3. 확정된 테마를 메시지에 포함하여 story_book_maker_pipeline으로 전달하세요.
 
-    Step 4. When the pipeline completes, present the final book to the user:
-            - Title
-            - Each page's text
-            - Each page's final assembled image filename
-            - A warm closing message
-            Example: "Your picture book is ready! 🎉
-                      Title: The Brave Baby Kitten's Adventure
-                      - Page 1: ... (final_page_01.jpeg)
-                      - Page 2: ... (final_page_02.jpeg)
-                      ..."
+    Step 4. 파이프라인이 완료되면 최종 그림책을 사용자에게 이렇게 제시하세요:
+            - 제목
+            - 표지 및 각 페이지의 텍스트
+            - 각 페이지의 최종 이미지 파일명 (final_page_00.jpeg ~ final_page_05.jpeg)
+            - 따뜻한 마무리 메시지
+            예시: "그림책이 완성되었습니다! 🎉
+                  제목: 용감한 아기 고양이의 모험
+                  - 표지 (final_page_00.jpeg)
+                  - 1페이지: ... (final_page_01.jpeg)
+                  - 2페이지: ... (final_page_02.jpeg)
+                  ..."
 
-    Always communicate in Korean unless the user speaks another language.
-    Never skip Step 1 — always confirm the theme before starting the pipeline.
+    항상 한국어로 소통하세요. 사용자가 다른 언어를 사용하는 경우 해당 언어로 소통하세요.
+    Step 1을 절대 건너뛰지 마세요 — 파이프라인 시작 전에 반드시 테마를 확인하세요.
     """,
     sub_agents=[pipeline_agent],
 )

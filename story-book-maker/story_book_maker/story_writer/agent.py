@@ -8,16 +8,41 @@ from ..callbacks import on_story_writing_done
 MODEL = LiteLlm(model="openai/gpt-4o")
 
 
+class CharacterSheet(BaseModel):
+    name: str = Field(
+        description="Short identifier for this character (e.g. 'bunny', 'wizard', 'fox'). "
+                    "Used in characters_present to reference who appears on each page."
+    )
+    appearance: str = Field(
+        description=(
+            "Detailed visual description used verbatim in every illustration prompt where "
+            "this character appears. Include: species/type, body size, fur/skin/scale color "
+            "and markings, eye color, clothing with exact colors and patterns, distinctive "
+            "accessories or features. "
+            "Example: 'a small orange tabby kitten with a white chest patch and bright green "
+            "eyes, wearing a tiny red scarf with white polka dots and a yellow sun hat, "
+            "fluffy tail with a dark tip'"
+        )
+    )
+
+
 # Pydantic model for a single page — ADK validates the LLM output against this schema
 class PageOutput(BaseModel):
     page_number: int = Field(description="Page number (1-5)")
     text: str = Field(description="Page body text in English, 2-3 sentences")
+    characters_present: List[str] = Field(
+        description=(
+            "List of character name identifiers (matching CharacterSheet.name) who are "
+            "visually present in this page's scene. Only include characters who actually "
+            "appear in the illustration — do not list off-screen characters."
+        )
+    )
     visual_description: str = Field(
         description=(
             "Image generation prompt in English, starting with "
             "'watercolor illustration, children's book style,' "
             "describing ONLY the scene, background, mood, action, and colors. "
-            "Do NOT repeat the character appearance here — that is in character_sheet."
+            "Do NOT describe character appearances here — those come from CharacterSheet."
         )
     )
 
@@ -27,17 +52,12 @@ class StoryOutput(BaseModel):
     theme: str = Field(description="The theme of the story")
     title: str = Field(description="A short, catchy title for the picture book")
     total_pages: int = Field(description="Total number of pages including title page (always 6)")
-    character_sheet: str = Field(
+    characters: List[CharacterSheet] = Field(
         description=(
-            "A single, detailed visual description of the main character(s) "
-            "that will be used verbatim in EVERY page illustration to keep "
-            "their appearance perfectly consistent. "
-            "Include: species, body size, fur/skin/scale color, eye color, "
-            "clothing with exact colors and patterns, any distinctive features "
-            "(spots, stripes, accessories, etc.). "
-            "Example: 'a small orange tabby kitten with a white chest patch and "
-            "bright green eyes, wearing a tiny red scarf with white polka dots "
-            "and a yellow sun hat, fluffy tail with a dark tip'"
+            "ALL characters who appear anywhere in the story, each with a detailed visual "
+            "description. Define EVERY character here before referencing them in any page. "
+            "The first entry is the main character. Secondary characters (friends, antagonists, "
+            "helpers, etc.) must also be listed here if they appear in any illustration."
         )
     )
     title_visual_description: str = Field(
@@ -63,15 +83,21 @@ story_writer_agent = Agent(
     ── title ────────────────────────────────────────────────────────────────
     A short, memorable title for the book (e.g. "The Brave Baby Kitten's Adventure").
 
-    ── character_sheet (CRITICAL for illustration consistency) ──────────────
-    Define the main character(s) ONCE with extreme visual specificity:
-    - Species and body size (e.g. "small orange tabby kitten")
-    - Exact fur / skin / scale color and any markings
-    - Eye color
-    - Clothing: item name + exact color + pattern
-      (e.g. "tiny red scarf with white polka dots", "yellow rain boots")
-    - Distinctive accessories or features (e.g. "round gold glasses")
-    This string will be prepended to EVERY page illustration prompt.
+    ── characters (CRITICAL — define ALL characters upfront) ─────────────────
+    List EVERY character who appears in ANY page illustration before writing pages.
+    Each entry needs:
+    - name: short identifier (e.g. "bunny", "wizard", "fox"). Used in characters_present.
+    - appearance: extremely detailed visual description injected verbatim into every
+      illustration where this character appears:
+        * Species and body size (e.g. "small orange tabby kitten")
+        * Exact fur / skin / scale color and markings
+        * Eye color
+        * Clothing: item + exact color + pattern
+          (e.g. "tiny red scarf with white polka dots", "yellow rain boots")
+        * Distinctive accessories (e.g. "round gold glasses", "silver wand")
+
+    RULE: ANY character visible in a visual_description MUST be listed in characters.
+    Do NOT introduce unnamed or undescribed characters inside visual_descriptions.
 
     ── title_visual_description (cover page) ────────────────────────────────
     - Must be written in English
@@ -80,11 +106,19 @@ story_writer_agent = Agent(
     - Include a rich, atmospheric background that hints at the story world
     - Do NOT include any text or lettering in the image
 
-    ── visual_description (per story page) ──────────────────────────────────
+    ── pages (5 story pages) ────────────────────────────────────────────────
+    For each page provide:
+
+    characters_present:
+    - List only the character name identifiers (from characters) who are VISUALLY
+      IN the scene on this page.
+    - Omit characters who are mentioned in text but not shown in the image.
+
+    visual_description:
     - Must be written in English
     - Start with "watercolor illustration, children's book style,"
     - Describe ONLY the scene: background, setting, action, mood, lighting, colors
-    - Do NOT describe the character's appearance here — that comes from character_sheet
+    - Do NOT describe character appearances — those come from the characters list
     - Example: "watercolor illustration, children's book style,
       standing at the edge of a dark enchanted forest, golden afternoon light
       filtering through the trees, soft pastel greens and yellows"
@@ -93,5 +127,3 @@ story_writer_agent = Agent(
     output_key="story_output",
     after_agent_callback=on_story_writing_done,
 )
-
-

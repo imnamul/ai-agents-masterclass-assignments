@@ -61,7 +61,8 @@ async def assemble_book(tool_context: ToolContext) -> dict:
     if not pages:
         return {"status": "error", "message": "No pages found in story_output."}
 
-    existing = await tool_context.list_artifacts()
+    existing = await tool_context.list_artifacts()   # used to verify source pages exist
+    run_artifacts = tool_context.state.get("current_run_artifacts", [])
     text_font  = _get_font(_TEXT_SIZE)
     num_font   = _get_font(_NUM_SIZE)
     title_font = _get_font(_TITLE_SIZE)
@@ -76,7 +77,7 @@ async def assemble_book(tool_context: ToolContext) -> dict:
     src_title = "page_00.jpeg"
     dst_title = "final_page_00.jpeg"
 
-    if dst_title in existing:
+    if dst_title in run_artifacts:
         results.append({"page_number": 0, "filename": dst_title, "skipped": True})
     elif src_title not in existing:
         results.append({"page_number": 0, "error": f"{src_title} not found"})
@@ -114,6 +115,8 @@ async def assemble_book(tool_context: ToolContext) -> dict:
                 inline_data=types.Blob(mime_type="image/jpeg", data=buf.getvalue())
             ),
         )
+        run_artifacts = run_artifacts + [dst_title]
+        tool_context.state["current_run_artifacts"] = run_artifacts
         results.append({"page_number": 0, "filename": dst_title, "skipped": False})
 
     # ── Story pages (page_01 – page_05) ──────────────────────────────────
@@ -122,7 +125,7 @@ async def assemble_book(tool_context: ToolContext) -> dict:
         src = f"page_{page_number:02d}.jpeg"
         dst = f"final_page_{page_number:02d}.jpeg"
 
-        if dst in existing:
+        if dst in run_artifacts:
             results.append({"page_number": page_number, "filename": dst, "skipped": True})
             continue
 
@@ -173,6 +176,8 @@ async def assemble_book(tool_context: ToolContext) -> dict:
                 inline_data=types.Blob(mime_type="image/jpeg", data=buf.getvalue())
             ),
         )
+        run_artifacts = run_artifacts + [dst]
+        tool_context.state["current_run_artifacts"] = run_artifacts
         results.append({"page_number": page_number, "filename": dst, "skipped": False})
 
     return {"status": "complete", "results": results}

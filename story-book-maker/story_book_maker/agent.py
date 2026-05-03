@@ -1,6 +1,8 @@
+from typing import Optional
 from google.adk.agents import Agent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmResponse
 from google.genai import types
 from .story_writer.agent import story_writer_agent
 from .illustrator.agent import illustrator_agent
@@ -32,10 +34,21 @@ def _status_agent(name: str, text: str) -> Agent:
     )
 
 
+def _reset_run_state(callback_context: CallbackContext) -> Optional[LlmResponse]:
+    """
+    Fires at the start of each pipeline run.
+    Clears the per-run artifact tracker so a second (or third…) story
+    in the same session regenerates all pages instead of being skipped.
+    """
+    callback_context.state["current_run_artifacts"] = []
+    return None
+
+
 # Step 1~3 pipeline — executes after theme is confirmed by the user
 pipeline_agent = SequentialAgent(
     name="story_book_maker_pipeline",
     description="Given a theme, writes a story, illustrates all pages, then assembles the final book",
+    before_agent_callback=_reset_run_state,
     sub_agents=[
         _status_agent("announce_story_writing",  "📖 Writing the story…"),
         story_writer_agent,           # Step 1: write the story

@@ -1,0 +1,7 @@
+{
+  "dependencies": ["graph.py"],
+  "graphs": {
+    "learnlog": "./graph.py:learnlog_graph"
+  },
+  "env": ".env"
+}

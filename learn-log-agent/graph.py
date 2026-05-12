@@ -8,6 +8,7 @@ langgraph dev 서버용 그래프 정의 파일
 
 import json
 import os
+import sqlite3
 import requests
 from typing import TypedDict, Annotated, List
 from datetime import date
@@ -19,6 +20,7 @@ load_dotenv()
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.types import interrupt, Command
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 # ── LangChain ──────────────────────────────────────────────────
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -49,6 +51,14 @@ class LearnLogState(TypedDict):
     search_results:     str
     diary_content:      str
     next_action:        str         # 조건 분기용
+    # ── 학습 커리큘럼 ────────────────────────────────────────────
+    curriculum:         dict        # 주차별 커리큘럼 구조
+    current_week:       int         # 현재 몇 주차
+    current_topic:      str         # 오늘 학습 토픽
+    tutor_persona:      str         # 동적 생성 튜터 System Prompt
+    quiz_history:       List[dict]  # 퀴즈 기록 (스페이스드 리피티션용)
+    progress_pct:       float       # 전체 진도율 (0.0 ~ 1.0)
+    user_level:         str         # 사용자 학습 수준 (beginner/intermediate/advanced)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -112,93 +122,242 @@ def post_to_notion(diary_content: str, learning_goal: str, mood: str, streak: in
 # Nodes
 # ══════════════════════════════════════════════════════════════
 
+def mood_node(state: LearnLogState) -> dict:
+    """노드 0: 기분 체크 (interrupt)"""
+    streak = state.get("streak", 0)
+
+    greeting = (
+        f"🎉 {streak}일 연속 달성 중이에요!\n\n오늘 기분이 어떠세요?"
+        if streak else
+        "LearnLog에 오신 걸 환영해요! 📚\n\n오늘 기분이 어떠세요?"
+    )
+    mood_input = interrupt(greeting)
+
+    mood_res = llm.invoke([HumanMessage(content=
+        f'사용자 기분: "{mood_input}"\n'
+        f"기분을 따뜻한 한 문장으로 요약해주세요. 문장만 출력하세요."
+    )])
+
+    return {
+        "messages": [HumanMessage(content=mood_input)],
+        "mood":     mood_res.content.strip(),
+    }
+
+
 def goal_check_node(state: LearnLogState) -> dict:
-    """노드 1: 기분 체크 + 목표 유지/변경 의향 파악 (interrupt)"""
+    """노드 1: 목표 유지/변경 의향 파악 (interrupt)"""
     existing_goals = state.get("learning_goals", [])
-    streak         = state.get("streak", 0)
 
     if existing_goals:
-        goals_str = ", ".join(f"'{g}'" for g in existing_goals)
-        question = (
-            f"안녕하세요! 🎉 {streak}일 연속 달성 중이에요!\n"
+        goals_str     = ", ".join(f"'{g}'" for g in existing_goals)
+        goal_question = (
             f"현재 목표: [{goals_str}]\n\n"
-            f"① 오늘 기분이 어떠세요?\n"
-            f"② 기존 목표를 계속할까요, 아니면 새로 추가/변경할까요?"
+            f"기존 목표를 계속할까요, 아니면 새로 추가/변경할까요?"
         )
     else:
-        question = (
-            f"LearnLog에 오신 걸 환영해요! 📚\n\n"
-            f"① 오늘 기분이 어떠세요?\n"
-            f"② 어떤 학습 목표가 있으신가요?"
-        )
+        goal_question = "어떤 학습 목표가 있으신가요? 🎯"
 
-    # ── interrupt: 그래프 일시정지 → 사용자 입력 대기 ──
-    user_response = interrupt(question)
+    goal_input = interrupt(goal_question)
 
-    # LLM으로 기분과 의향 분석
-    analysis_prompt = f"""사용자 응답: "{user_response}"
+    goal_res = llm.invoke([HumanMessage(content=f"""사용자 응답: "{goal_input}"
+기존 목표: {existing_goals if existing_goals else '없음'}
 
-아래 JSON 형식으로만 응답해주세요:
+JSON으로 응답해주세요:
 {{
-  "mood": "오늘 기분을 따뜻한 한 문장으로 요약",
   "wants_new_goal": true 또는 false,
-  "goal_text": "사용자가 언급한 학습 목표만 추출 (없으면 null)"
+  "goal_text": "학습 주제명만 간결하게 추출 (예: 'LangGraph', 'Python 기초', '영어 회화'). 없으면 null"
 }}
 
 판단 기준:
 - '새로운', '추가', '바꾸', '변경', '다른 목표' → wants_new_goal: true
 - '계속', '유지', '그대로', 변경 요청 없음      → wants_new_goal: false
-- 기존 목표가 없는 경우                          → wants_new_goal: true"""
+- 기존 목표가 없는 경우                          → wants_new_goal: true
 
-    analysis = llm.invoke([HumanMessage(content=analysis_prompt)])
+JSON만 응답해주세요.""")])
 
     try:
-        raw    = analysis.content.strip().removeprefix("```json").removesuffix("```").strip()
-        parsed = json.loads(raw)
-        mood      = parsed.get("mood", user_response[:50])
+        raw       = goal_res.content.strip().removeprefix("```json").removesuffix("```").strip()
+        parsed    = json.loads(raw)
         wants_new = parsed.get("wants_new_goal", not bool(existing_goals))
         goal_text = parsed.get("goal_text") or ""
     except Exception:
         change_kw = ["새로", "추가", "변경", "바꾸", "다른"]
-        wants_new = any(kw in user_response for kw in change_kw) or not existing_goals
-        mood      = user_response[:50]
-        goal_text = ""
+        wants_new = any(kw in goal_input for kw in change_kw) or not existing_goals
+        goal_text = goal_input
 
     return {
-        "messages":    [HumanMessage(content=user_response)],
-        "mood":         mood,
-        "active_goal":  goal_text,
-        "next_action":  "setup" if wants_new else "skip",
+        "messages":   [HumanMessage(content=goal_input)],
+        "active_goal": goal_text,
+        "next_action": "setup" if wants_new else "skip",
+    }
+
+
+def goal_detail_node(state: LearnLogState) -> dict:
+    """노드 1-2: 학습 수준 및 집중 영역 수집 (interrupt)"""
+    goal = state.get("active_goal", "")
+
+    question = (
+        f"🎯 목표: {goal}\n\n"
+        f"맞춤 학습 계획을 만들기 위해 조금 더 알고 싶어요!\n\n"
+        f"① 현재 수준이 어느 정도인가요?\n"
+        f"   (입문 / 초급 / 중급 / 고급)\n\n"
+        f"② 특별히 집중하고 싶은 부분이 있나요?\n"
+        f"   (없으면 '없어요'라고 해주세요)"
+    )
+
+    user_detail = interrupt(question)
+
+    detail_res = llm.invoke([HumanMessage(content=f"""사용자 응답: "{user_detail}"
+
+JSON으로 추출해주세요:
+{{
+  "level": "beginner / intermediate / advanced",
+  "focus": "집중하고 싶은 부분 요약 (없으면 null)"
+}}
+
+레벨 판단 기준:
+- 입문, 처음, 모름, 아무것도 모름 → beginner
+- 기초는 있어, 조금 알아, 초급   → intermediate
+- 많이 알아, 심화, 고급           → advanced
+
+JSON만 응답해주세요.""")])
+
+    try:
+        raw    = detail_res.content.strip().removeprefix("```json").removesuffix("```").strip()
+        parsed = json.loads(raw)
+        level  = parsed.get("level", "beginner")
+        focus  = parsed.get("focus") or ""
+    except Exception:
+        level = "beginner"
+        focus = ""
+
+    # focus가 있으면 active_goal에 context로 추가
+    refined_goal = f"{goal} ({focus})" if focus else goal
+
+    return {
+        "messages":   [HumanMessage(content=user_detail)],
+        "user_level": level,
+        "active_goal": refined_goal,
     }
 
 
 def goal_setup_node(state: LearnLogState) -> dict:
-    """노드 2: 새 학습 목표 설정 or 기존 목표에 추가"""
+    """노드 2: 학습 계획 수립 (습관 + 커리큘럼 + 튜터 페르소나 통합)"""
     existing_goals = state.get("learning_goals", [])
     new_goal       = state.get("active_goal", "")
+    user_level     = state.get("user_level", "beginner")
+    updated_goals  = (existing_goals + [new_goal]
+                      if new_goal and new_goal not in existing_goals
+                      else existing_goals)
 
-    system_prompt = f"""당신은 학습 코치 LearnLog입니다.
-사용자의 새 학습 목표를 확인하고, 매일 실천 가능한 습관 3가지로 분해해주세요.
+    # ── Step 1: 도메인 분석 ─────────────────────────────────────
+    domain_res = llm.invoke([HumanMessage(content=f"""학습 목표: "{new_goal}"
+사용자 수준: "{user_level}"
 
-새 학습 목표: {new_goal}
-기존 목표: {existing_goals if existing_goals else '없음'}
+JSON으로 분석해주세요:
+{{
+  "domain": "programming / language / science / art / ...",
+  "subject": "구체적인 주제명",
+  "level": "{user_level}",
+  "learning_style": "conceptual / hands-on / mixed",
+  "estimated_weeks": 숫자,
+  "prerequisites": []
+}}
 
-출력 형식:
-🎯 목표 목록: [목표1, 목표2, ...]
-📋 일일 습관:
-  1. [습관] (XX분)
-  2. [습관] (XX분)
-  3. [습관] (XX분)
+JSON만 응답해주세요.""")])
 
-마지막에 체크인 준비가 됐는지 물어보세요."""
+    try:
+        domain = json.loads(
+            domain_res.content.strip()
+            .removeprefix("```json").removesuffix("```").strip()
+        )
+    except Exception:
+        domain = {
+            "domain": "general", "subject": new_goal,
+            "level": user_level, "learning_style": "mixed",
+            "estimated_weeks": 4, "prerequisites": []
+        }
 
-    response      = llm.invoke([SystemMessage(content=system_prompt)])
-    updated_goals = existing_goals + [new_goal] if new_goal else existing_goals
+    # ── Step 2: 커리큘럼 생성 ───────────────────────────────────
+    curriculum_res = llm.invoke([HumanMessage(content=f"""주제: {domain['subject']}
+레벨: {domain['level']} / 학습 방식: {domain['learning_style']} / 총 기간: {domain['estimated_weeks']}주
+
+JSON으로 만들어주세요:
+{{
+  "domain": "{domain['domain']}",
+  "subject": "{domain['subject']}",
+  "level": "{domain['level']}",
+  "total_weeks": {domain['estimated_weeks']},
+  "daily_minutes": 60,
+  "phases": [
+    {{"week": 1, "theme": "주제", "topics": ["토픽1", "토픽2"], "checkpoint": "완료 기준"}}
+  ]
+}}
+
+JSON만 응답해주세요.""")])
+
+    try:
+        curriculum = json.loads(
+            curriculum_res.content.strip()
+            .removeprefix("```json").removesuffix("```").strip()
+        )
+    except Exception:
+        curriculum = {
+            "domain": domain["domain"], "subject": new_goal,
+            "level": domain["level"], "total_weeks": domain["estimated_weeks"],
+            "daily_minutes": 60,
+            "phases": [{"week": 1, "theme": new_goal, "topics": [], "checkpoint": ""}]
+        }
+
+    # ── Step 3: 일일 습관 분해 ──────────────────────────────────
+    habits_res = llm.invoke([HumanMessage(content=
+        f"학습 목표: {new_goal}\n"
+        f"수준: {user_level}\n"
+        f"하루 학습 시간: {curriculum['daily_minutes']}분\n\n"
+        f"매일 실천 가능한 습관 3가지를 간결하게 번호 목록으로만 출력해주세요."
+    )])
+    habits_text = habits_res.content.strip()
+
+    # ── Step 4: 튜터 페르소나 생성 ──────────────────────────────
+    first_topic = curriculum["phases"][0]["theme"] if curriculum.get("phases") else new_goal
+
+    persona_res = llm.invoke([HumanMessage(content=f"""당신은 최고의 교육 설계자입니다.
+아래 정보를 바탕으로 AI 튜터의 시스템 프롬프트를 작성해주세요.
+
+- 주제: {curriculum['subject']} / 도메인: {curriculum['domain']}
+- 수준: {curriculum['level']} / 학습 방식: {domain['learning_style']}
+- 총 기간: {curriculum['total_weeks']}주 / 오늘 주제: {first_topic}
+
+요구사항:
+- 해당 분야 전문가 AI 튜터 페르소나
+- 도메인 특성에 맞는 교육 원칙 3~5가지
+- 수준({curriculum['level']})에 맞는 접근 방식 명시
+- 시스템 프롬프트만 작성, 다른 설명 없이""")])
+    tutor_persona = persona_res.content.strip()
+
+    # ── 통합 메시지 (질문 없이 정보만) ─────────────────────────
+    phases_summary = "\n".join([
+        f"  {p['week']}주차: {p['theme']}"
+        for p in curriculum.get("phases", [])
+    ])
+
+    summary_msg = (
+        f"📚 **{curriculum['subject']}** 학습 플랜을 준비했어요!\n\n"
+        f"📋 일일 습관:\n{habits_text}\n\n"
+        f"📅 {curriculum['total_weeks']}주 커리큘럼 (하루 {curriculum['daily_minutes']}분):\n"
+        f"{phases_summary}"
+    )
 
     return {
-        "messages":      [response],
-        "learning_goals": updated_goals,
-        "active_goal":   new_goal or (existing_goals[0] if existing_goals else ""),
+        "messages":       [AIMessage(content=summary_msg)],
+        "learning_goals":  updated_goals,
+        "active_goal":    new_goal,
+        "curriculum":     curriculum,
+        "tutor_persona":  tutor_persona,
+        "current_week":   1,
+        "current_topic":  first_topic,
+        "progress_pct":   0.0,
+        "quiz_history":   [],
     }
 
 
@@ -207,30 +366,42 @@ def checkin_node(state: LearnLogState) -> dict:
     streak      = state.get("streak", 0)
     active_goal = get_active_goal(state)
 
+    streak_msg = f"🔥 {streak}일 연속 달성 중!" if streak > 0 else "🌱 오늘부터 시작이에요!"
+
     question = (
-        f"🔥 {streak}일 연속 달성 중!\n"
+        f"{streak_msg}\n"
         f"오늘 목표: {active_goal}\n\n"
         f"오늘 어떤 학습을 하셨나요? 😊\n"
-        f"(관련 자료가 필요하면 '자료 찾아줘' 또는 '검색해줘'를 포함해주세요)"
+        f"(관련 자료가 필요하면 '검색해줘', 퀴즈로 복습하고 싶으면 '퀴즈'를 포함해주세요)"
     )
 
-    # ── interrupt: 두 번째 일시정지 ──
     user_input = interrupt(question)
 
     search_keywords = ["검색", "자료", "찾아", "추천", "알려",
                        "search", "find", "resource", "recommend", "look up"]
-    needs_search    = any(kw in user_input.lower() for kw in search_keywords)
+    quiz_keywords   = ["퀴즈", "문제", "테스트", "확인", "복습",
+                       "quiz", "test", "question", "review", "check"]
+
+    needs_search = any(kw in user_input.lower() for kw in search_keywords)
+    needs_quiz   = any(kw in user_input.lower() for kw in quiz_keywords)
+
+    if needs_search:
+        next_action = "search"
+    elif needs_quiz:
+        next_action = "quiz"
+    else:
+        next_action = "write"
 
     return {
         "messages":          [HumanMessage(content=user_input)],
         "today_achievements": user_input,
         "streak":            streak + 1,
-        "next_action":       "search" if needs_search else "write",
+        "next_action":       next_action,
     }
 
 
 def resource_search_node(state: LearnLogState) -> dict:
-    """노드 4: Tavily로 학습 자료 검색"""
+    """노드 4: Tavily로 학습 자료 검색 + 퀴즈 여부 확인 (interrupt)"""
     goal         = get_active_goal(state)
     achievements = state.get("today_achievements", "")
     query        = f"{goal} {achievements} 학습 자료".strip()
@@ -246,17 +417,94 @@ def resource_search_node(state: LearnLogState) -> dict:
             ])
     except Exception as e:
         error_msg = f"검색 중 오류가 발생했어요: {e}\n직접 검색해보시는 걸 추천드려요 🙏"
-        return {"messages": [AIMessage(content=error_msg)], "search_results": ""}
+        return {"messages": [AIMessage(content=error_msg)], "search_results": "", "next_action": "write"}
 
     response = llm.invoke([SystemMessage(
         content=f"학습 목표: {goal}\n오늘 학습 내용: {achievements}\n\n검색 결과:\n{formatted}\n\n자료를 친절하게 소개해주세요."
     )])
 
-    return {"messages": [response], "search_results": formatted}
+    # ── 퀴즈 제안 interrupt ─────────────────────────────────────
+    quiz_offer = interrupt(
+        f"{response.content}\n\n"
+        f"---\n"
+        f"📝 방금 찾은 자료를 바탕으로 퀴즈를 풀어볼까요? (예 / 아니요)"
+    )
+
+    wants_quiz = any(kw in quiz_offer.lower() for kw in
+                     ["예", "네", "응", "ㅇ", "좋아", "yes", "y", "퀴즈", "해줘"])
+
+    return {
+        "messages":       [response],
+        "search_results": formatted,
+        "next_action":    "quiz" if wants_quiz else "write",
+    }
+
+
+def quiz_node(state: LearnLogState) -> dict:
+    """노드 4-2: 오늘 학습 내용 기반 퀴즈 (interrupt)"""
+    tutor_persona = state.get("tutor_persona", "")
+    goal          = get_active_goal(state)
+    achievements  = state.get("today_achievements", "") or goal
+    current_topic = state.get("current_topic", goal)
+    quiz_history  = state.get("quiz_history", [])
+
+    system = (SystemMessage(content=tutor_persona) if tutor_persona
+              else SystemMessage(content=f"당신은 {goal} 전문 튜터입니다."))
+
+    # ── Step 1: 퀴즈 문제 생성 ─────────────────────────────────
+    question_prompt = HumanMessage(content=f"""오늘 학습한 내용을 바탕으로 퀴즈 3문제를 만들어주세요.
+
+오늘 학습 주제: {current_topic}
+오늘 학습 내용: {achievements}
+
+요구사항:
+- 핵심 개념을 확인할 수 있는 질문
+- 단계적 난이도 (쉬움 → 보통 → 어려움)
+- 번호를 붙여 명확하게 구분
+
+퀴즈만 제시하고 답은 포함하지 마세요.""")
+
+    quiz_questions = llm.invoke([system, question_prompt]).content
+
+    # ── Step 2: interrupt — 사용자 답변 대기 ─────────────────
+    user_answers = interrupt(
+        f"📝 오늘의 퀴즈입니다!\n\n{quiz_questions}\n\n"
+        f"위 문제들에 답해주세요. 모르는 건 '모르겠어요'라고 써도 괜찮아요 😊"
+    )
+
+    # ── Step 3: 답변 평가 + 피드백 ────────────────────────────
+    eval_prompt = HumanMessage(content=f"""퀴즈 문제:
+{quiz_questions}
+
+학생 답변:
+{user_answers}
+
+각 문제에 대해 피드백을 주세요:
+- 정답 여부
+- 핵심 개념 보충 설명
+- 격려 메시지
+
+마지막에 전체 점수(X/3)와 다음 복습 토픽을 알려주세요.""")
+
+    eval_res = llm.invoke([system, eval_prompt])
+
+    # ── Step 4: quiz_history 업데이트 ─────────────────────────
+    new_record = {
+        "date":      date.today().isoformat(),
+        "topic":     current_topic,
+        "questions": quiz_questions,
+        "answers":   user_answers,
+        "feedback":  eval_res.content,
+    }
+
+    return {
+        "messages":    [AIMessage(content=eval_res.content)],
+        "quiz_history": quiz_history + [new_record],
+    }
 
 
 def diary_writer_node(state: LearnLogState) -> dict:
-    """노드 5: 기분 + 성취를 묶어 일기 작성 (검색 자료는 채팅 메시지로만 제공)"""
+    """노드 5: 기분 + 성취를 묶어 일기 작성"""
     today        = date.today().strftime("%Y년 %m월 %d일")
     mood         = state.get("mood", "") or "평온한 하루"
     goal         = get_active_goal(state)
@@ -302,7 +550,6 @@ def notion_post_node(state: LearnLogState) -> dict:
     mood   = state.get("mood", "") or "평온한 하루"
     streak = state.get("streak", 0)
 
-    # 포인트 1: diary_content 빈 값 guard
     if not diary:
         return {"messages": [AIMessage(content="일기 내용이 없어서 Notion 저장을 건너뛰었어요.")]}
 
@@ -313,7 +560,6 @@ def notion_post_node(state: LearnLogState) -> dict:
         "streak":        streak,
     })
 
-    # 포인트 2: 성공/실패에 따라 메시지 분기
     if result.startswith("✅"):
         final = (
             f"📔 오늘의 학습 일기가 Notion에 저장됐어요!\n\n"
@@ -336,13 +582,23 @@ def notion_post_node(state: LearnLogState) -> dict:
 # ══════════════════════════════════════════════════════════════
 
 def route_after_goal_check(state: LearnLogState) -> str:
-    """CE1: 'setup' → goal_setup / 'skip' → checkin"""
+    """CE1: 'setup' → goal_detail / 'skip' → checkin"""
     return state.get("next_action", "skip")
 
 
 def route_after_checkin(state: LearnLogState) -> str:
-    """CE2: 'search' → resource_search / 'write' → diary_writer"""
-    return state.get("next_action", "write")
+    """CE2: 'search' → resource_search / 'quiz' → quiz / 'write' → diary_writer"""
+    action = state.get("next_action", "write")
+    if action == "search":
+        return "resource_search"
+    if action == "quiz":
+        return "quiz"
+    return "diary_writer"
+
+
+def route_after_resource_search(state: LearnLogState) -> str:
+    """CE3: 검색 후 퀴즈 제안 결과에 따라 분기"""
+    return "quiz" if state.get("next_action") == "quiz" else "diary_writer"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -353,35 +609,52 @@ def build_graph():
     builder = StateGraph(LearnLogState)
 
     # 노드 등록
+    builder.add_node("mood_check",      mood_node)
     builder.add_node("goal_check",      goal_check_node)
+    builder.add_node("goal_detail",     goal_detail_node)
     builder.add_node("goal_setup",      goal_setup_node)
     builder.add_node("checkin",         checkin_node)
     builder.add_node("resource_search", resource_search_node)
+    builder.add_node("quiz",            quiz_node)
     builder.add_node("diary_writer",    diary_writer_node)
     builder.add_node("notion_post",     notion_post_node)
 
     # 엣지
-    builder.add_edge(START, "goal_check")
+    builder.add_edge(START,        "mood_check")
+    builder.add_edge("mood_check", "goal_check")
 
     builder.add_conditional_edges(
         "goal_check",
         route_after_goal_check,
-        {"setup": "goal_setup", "skip": "checkin"},
+        {"setup": "goal_detail", "skip": "checkin"},
     )
 
-    builder.add_edge("goal_setup", "checkin")
+    builder.add_edge("goal_detail", "goal_setup")
+    builder.add_edge("goal_setup",  "checkin")
 
     builder.add_conditional_edges(
         "checkin",
         route_after_checkin,
-        {"search": "resource_search", "write": "diary_writer"},
+        {
+            "resource_search": "resource_search",
+            "quiz":            "quiz",
+            "diary_writer":    "diary_writer",
+        },
     )
 
-    builder.add_edge("resource_search", "diary_writer")
-    builder.add_edge("diary_writer",    "notion_post")
-    builder.add_edge("notion_post",     END)
+    builder.add_conditional_edges(
+        "resource_search",
+        route_after_resource_search,
+        {"quiz": "quiz", "diary_writer": "diary_writer"},
+    )
 
-    return builder.compile()
+    builder.add_edge("quiz",         "diary_writer")
+    builder.add_edge("diary_writer", "notion_post")
+    builder.add_edge("notion_post",  END)
+
+    conn   = sqlite3.connect("learnlog.db", check_same_thread=False)
+    memory = SqliteSaver(conn)
+    return builder.compile(checkpointer=memory)
 
 
 # langgraph dev 가 이 변수를 import 해서 사용합니다

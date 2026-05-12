@@ -1,0 +1,385 @@
+"""
+LearnLog 노드 단위 테스트
+Mock LLM 사용 — API 비용 없음
+
+실행:
+    uv run pytest tests/test_nodes.py -v
+"""
+import json
+import pytest
+from unittest.mock import patch, MagicMock
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+from graph import (
+    get_active_goal,
+    mood_node,
+    goal_check_node,
+    goal_detail_node,
+    goal_setup_node,
+    checkin_node,
+    quiz_node,
+    diary_writer_node,
+    notion_post_node,
+)
+
+
+# ── Helper ──────────────────────────────────────────────────────
+
+def make_llm_response(content: str) -> MagicMock:
+    mock = MagicMock()
+    mock.content = content
+    return mock
+
+
+# ── get_active_goal ─────────────────────────────────────────────
+
+def test_get_active_goal_returns_active_goal(state_with_goal):
+    assert get_active_goal(state_with_goal) == "LangGraph 공부"
+
+
+def test_get_active_goal_fallback_to_list(base_state):
+    state = {**base_state, "learning_goals": ["Python 기초"], "active_goal": ""}
+    assert get_active_goal(state) == "Python 기초"
+
+
+def test_get_active_goal_empty(base_state):
+    assert get_active_goal(base_state) == ""
+
+
+# ── mood_node ───────────────────────────────────────────────────
+
+def test_mood_node_returns_mood(base_state):
+    """기분 입력이 요약되어 mood에 저장되는지"""
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="오늘 너무 피곤해요"):
+        mock_llm.invoke.return_value = make_llm_response("지친 하루였지만 잘 버텼어요.")
+        result = mood_node(base_state)
+
+    assert result["mood"] == "지친 하루였지만 잘 버텼어요."
+    assert isinstance(result["messages"][0], HumanMessage)
+    assert result["messages"][0].content == "오늘 너무 피곤해요"
+
+
+def test_mood_node_greeting_with_streak(base_state):
+    """streak이 있으면 연속달성 메시지가 포함되는지"""
+    state = {**base_state, "streak": 7}
+
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt") as mock_interrupt:
+        mock_interrupt.return_value = "좋아요"
+        mock_llm.invoke.return_value = make_llm_response("활기찬 하루!")
+        mood_node(state)
+
+    prompt_shown = mock_interrupt.call_args[0][0]
+    assert "7일" in prompt_shown
+
+
+def test_mood_node_greeting_new_user(base_state):
+    """streak이 0이면 환영 메시지가 표시되는지"""
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt") as mock_interrupt:
+        mock_interrupt.return_value = "좋아요"
+        mock_llm.invoke.return_value = make_llm_response("활기찬 하루!")
+        mood_node(base_state)
+
+    prompt_shown = mock_interrupt.call_args[0][0]
+    assert "환영" in prompt_shown
+
+
+# ── goal_check_node ─────────────────────────────────────────────
+
+def test_goal_check_new_user_wants_new_goal(base_state):
+    """신규 사용자 → wants_new_goal=True, goal_text 추출"""
+    goal_json = '{"wants_new_goal": true, "goal_text": "Python 기초"}'
+
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="Python 공부하고 싶어요"):
+        mock_llm.invoke.return_value = make_llm_response(goal_json)
+        result = goal_check_node(base_state)
+
+    assert result["next_action"] == "setup"
+    assert result["active_goal"] == "Python 기초"
+
+
+def test_goal_check_existing_user_keeps_goal(state_with_goal):
+    """기존 목표 있는 사용자가 계속 선택 → skip"""
+    goal_json = '{"wants_new_goal": false, "goal_text": null}'
+
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="그대로 유지할게요"):
+        mock_llm.invoke.return_value = make_llm_response(goal_json)
+        result = goal_check_node(state_with_goal)
+
+    assert result["next_action"] == "skip"
+    assert result["active_goal"] == ""
+
+
+def test_goal_check_fallback_on_json_error(base_state):
+    """LLM이 잘못된 JSON 반환 시 user input을 goal로 사용"""
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="LangGraph 마스터하기"):
+        mock_llm.invoke.return_value = make_llm_response("잘못된 응답")
+        result = goal_check_node(base_state)
+
+    assert result["next_action"] == "setup"
+    assert result["active_goal"] == "LangGraph 마스터하기"
+
+
+# ── goal_detail_node ────────────────────────────────────────────
+
+def test_goal_detail_extracts_level(state_with_goal):
+    """사용자 응답에서 레벨이 추출되는지"""
+    detail_json = '{"level": "intermediate", "focus": null}'
+
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="중급 수준이에요. 집중하고 싶은 부분은 없어요"):
+        mock_llm.invoke.return_value = make_llm_response(detail_json)
+        result = goal_detail_node(state_with_goal)
+
+    assert result["user_level"] == "intermediate"
+    assert result["active_goal"] == "LangGraph 공부"  # focus 없으면 그대로
+
+
+def test_goal_detail_appends_focus_to_goal(state_with_goal):
+    """focus가 있으면 active_goal에 추가되는지"""
+    detail_json = '{"level": "beginner", "focus": "StateGraph 위주"}'
+
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="입문이고 StateGraph 위주로 배우고 싶어요"):
+        mock_llm.invoke.return_value = make_llm_response(detail_json)
+        result = goal_detail_node(state_with_goal)
+
+    assert result["user_level"] == "beginner"
+    assert "StateGraph 위주" in result["active_goal"]
+
+
+def test_goal_detail_fallback_on_json_error(state_with_goal):
+    """LLM JSON 오류 시 beginner로 fallback"""
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="잘 모르겠어요"):
+        mock_llm.invoke.return_value = make_llm_response("잘못된 응답")
+        result = goal_detail_node(state_with_goal)
+
+    assert result["user_level"] == "beginner"
+
+
+# ── goal_setup_node ─────────────────────────────────────────────
+
+def test_goal_setup_generates_plan(state_with_goal):
+    """goal_setup_node가 curriculum, tutor_persona, 메시지를 생성하는지"""
+    domain_json = json.dumps({
+        "domain": "programming", "subject": "LangGraph",
+        "level": "intermediate", "learning_style": "hands-on",
+        "estimated_weeks": 6, "prerequisites": []
+    })
+    curriculum_json = json.dumps({
+        "domain": "programming", "subject": "LangGraph",
+        "level": "intermediate", "total_weeks": 6, "daily_minutes": 60,
+        "phases": [{"week": 1, "theme": "LangGraph 기초",
+                    "topics": ["StateGraph"], "checkpoint": "기본 그래프 만들기"}]
+    })
+    habits_str  = "1. 이론 정리 (20분)\n2. 예제 실습 (30분)\n3. 복습 (10분)"
+    persona_str = "당신은 LangGraph 전문 강사입니다."
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.side_effect = [
+            make_llm_response(domain_json),
+            make_llm_response(curriculum_json),
+            make_llm_response(habits_str),
+            make_llm_response(persona_str),
+        ]
+        result = goal_setup_node(state_with_goal)
+
+    assert result["curriculum"]["total_weeks"] == 6
+    assert result["current_week"] == 1
+    assert result["current_topic"] == "LangGraph 기초"
+    assert result["tutor_persona"] == persona_str
+    assert result["progress_pct"] == 0.0
+    assert result["quiz_history"] == []
+    assert "LangGraph 공부" in result["learning_goals"]
+
+
+def test_goal_setup_uses_user_level(state_with_goal):
+    """user_level이 LLM 프롬프트에 포함되는지"""
+    state = {**state_with_goal, "user_level": "advanced"}
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response("잘못된 응답")
+        goal_setup_node(state)
+
+    first_prompt = mock_llm.invoke.call_args_list[0][0][0][0].content
+    assert "advanced" in first_prompt
+
+
+def test_goal_setup_fallback_on_json_error(state_with_goal):
+    """LLM이 잘못된 JSON 반환해도 fallback으로 처리"""
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response("잘못된 응답")
+        result = goal_setup_node(state_with_goal)
+
+    assert "curriculum" in result
+    assert result["curriculum"]["subject"] == "LangGraph 공부"
+
+
+# ── checkin_node ────────────────────────────────────────────────
+
+@pytest.mark.parametrize("user_input,expected", [
+    ("오늘 LangGraph 공부했어요. 자료 찾아줘",  "search"),
+    ("관련 내용 검색해줘",                       "search"),
+    ("find some resources for me",             "search"),
+    ("퀴즈 풀고 싶어요",                         "quiz"),
+    ("오늘 배운 거 복습 quiz 해줘",              "quiz"),
+    ("오늘 공부 잘 했어요!",                     "write"),
+    ("interrupt() 개념을 이해했어요",            "write"),
+])
+def test_checkin_keyword_detection(base_state, user_input, expected):
+    state = {**base_state, "active_goal": "LangGraph", "streak": 3}
+
+    with patch("graph.interrupt", return_value=user_input):
+        result = checkin_node(state)
+
+    assert result["next_action"] == expected
+
+
+def test_checkin_streak_zero_message(base_state):
+    """streak=0이면 '오늘부터 시작' 메시지"""
+    with patch("graph.interrupt") as mock_interrupt:
+        mock_interrupt.return_value = "공부했어요"
+        checkin_node(base_state)
+
+    prompt = mock_interrupt.call_args[0][0]
+    assert "오늘부터 시작" in prompt
+
+
+def test_checkin_streak_positive_message(state_with_goal):
+    """streak>0이면 연속달성 메시지"""
+    with patch("graph.interrupt") as mock_interrupt:
+        mock_interrupt.return_value = "공부했어요"
+        checkin_node(state_with_goal)
+
+    prompt = mock_interrupt.call_args[0][0]
+    assert "연속 달성" in prompt
+
+
+def test_checkin_increments_streak(base_state):
+    state = {**base_state, "streak": 4}
+
+    with patch("graph.interrupt", return_value="오늘 공부했어요"):
+        result = checkin_node(state)
+
+    assert result["streak"] == 5
+
+
+def test_checkin_saves_achievements(base_state):
+    user_msg = "LangGraph StateGraph를 실습했어요"
+
+    with patch("graph.interrupt", return_value=user_msg):
+        result = checkin_node(base_state)
+
+    assert result["today_achievements"] == user_msg
+
+
+# ── quiz_node ───────────────────────────────────────────────────
+
+def test_quiz_node_returns_feedback_message(state_with_search):
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="1. StateGraph  2. 모르겠어요  3. interrupt"):
+        mock_llm.invoke.side_effect = [
+            make_llm_response("1번 문제: StateGraph란?\n2번 문제: ...\n3번 문제: ..."),
+            make_llm_response("1번 정답! 2번 아쉬워요. 전체 점수: 2/3"),
+        ]
+        result = quiz_node(state_with_search)
+
+    assert "quiz_history" in result
+    assert len(result["quiz_history"]) == 1
+    assert result["quiz_history"][0]["topic"] == "LangGraph 기초"
+
+
+def test_quiz_node_appends_to_existing_history(state_with_search):
+    existing = [{"date": "2026-01-01", "topic": "이전 토픽", "questions": "", "answers": "", "feedback": ""}]
+    state = {**state_with_search, "quiz_history": existing}
+
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="답변입니다"):
+        mock_llm.invoke.side_effect = [
+            make_llm_response("퀴즈 문제들..."),
+            make_llm_response("피드백: 잘했어요! 점수: 3/3"),
+        ]
+        result = quiz_node(state)
+
+    assert len(result["quiz_history"]) == 2
+
+
+def test_quiz_node_uses_tutor_persona(state_with_search):
+    with patch("graph.llm") as mock_llm, \
+         patch("graph.interrupt", return_value="답변"):
+        mock_llm.invoke.side_effect = [
+            make_llm_response("퀴즈 문제들..."),
+            make_llm_response("피드백"),
+        ]
+        quiz_node(state_with_search)
+
+    first_call_messages = mock_llm.invoke.call_args_list[0][0][0]
+    assert isinstance(first_call_messages[0], SystemMessage)
+    assert "LangGraph 전문 강사" in first_call_messages[0].content
+
+
+# ── diary_writer_node ───────────────────────────────────────────
+
+def test_diary_writer_mood_fallback(state_with_goal):
+    """mood가 비어있으면 '평온한 하루' 사용"""
+    state = {**state_with_goal, "mood": ""}
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response("오늘의 일기...")
+        diary_writer_node(state)
+
+    system_content = mock_llm.invoke.call_args[0][0][0].content
+    assert "평온한 하루" in system_content
+
+
+def test_diary_writer_achievements_fallback(state_with_goal):
+    """today_achievements가 비어있으면 fallback 메시지 사용"""
+    state = {**state_with_goal, "today_achievements": ""}
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response("오늘의 일기...")
+        diary_writer_node(state)
+
+    system_content = mock_llm.invoke.call_args[0][0][0].content
+    assert "오늘의 학습을 기록하지 않았어요" in system_content
+
+
+def test_diary_writer_returns_diary_content(state_with_goal):
+    state = {**state_with_goal, "mood": "좋아요", "today_achievements": "공부했어요"}
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response("완성된 일기 내용입니다.")
+        result = diary_writer_node(state)
+
+    assert result["diary_content"] == "완성된 일기 내용입니다."
+
+
+# ── notion_post_node ────────────────────────────────────────────
+
+def test_notion_post_skips_when_diary_empty(state_with_goal):
+    state  = {**state_with_goal, "diary_content": ""}
+    result = notion_post_node(state)
+
+    assert "건너뛰었어요" in result["messages"][0].content
+
+
+def test_notion_post_success_message(state_with_diary):
+    with patch("graph.post_to_notion") as mock_tool:
+        mock_tool.invoke.return_value = "✅ Notion 포스팅 성공! https://notion.so/..."
+        result = notion_post_node(state_with_diary)
+
+    assert "저장됐어요" in result["messages"][0].content
+
+
+def test_notion_post_failure_message(state_with_diary):
+    with patch("graph.post_to_notion") as mock_tool:
+        mock_tool.invoke.return_value = "⚠️ 오류 (400): 연결 실패"
+        result = notion_post_node(state_with_diary)
+
+    assert "실패" in result["messages"][0].content

@@ -8,6 +8,7 @@ langgraph dev 서버용 그래프 정의 파일
 
 import json
 import os
+import re
 import sqlite3
 import requests
 from typing import TypedDict, Annotated, List
@@ -68,6 +69,31 @@ class LearnLogState(TypedDict):
 def get_active_goal(state: LearnLogState) -> str:
     """active_goal이 없으면 learning_goals[0]으로 폴백"""
     return state.get("active_goal") or (state.get("learning_goals") or [""])[0]
+
+
+def parse_json(text: str) -> dict | None:
+    """LLM 응답에서 JSON을 안정적으로 추출 (마크다운 펜스, 대소문자, 앞뒤 설명 텍스트 모두 처리)"""
+    text = text.strip()
+    # 1) 직접 파싱
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # 2) ```json ... ``` 또는 ``` ... ``` 안에서 추출
+    m = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # 3) 텍스트 안의 첫 번째 { ... } 블록 추출
+    m = re.search(r"\{[\s\S]*\}", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -175,12 +201,11 @@ JSON으로 응답해주세요:
 
 JSON만 응답해주세요.""")])
 
-    try:
-        raw       = goal_res.content.strip().removeprefix("```json").removesuffix("```").strip()
-        parsed    = json.loads(raw)
+    parsed    = parse_json(goal_res.content)
+    if parsed:
         wants_new = parsed.get("wants_new_goal", not bool(existing_goals))
         goal_text = parsed.get("goal_text") or ""
-    except Exception:
+    else:
         change_kw = ["새로", "추가", "변경", "바꾸", "다른"]
         wants_new = any(kw in goal_input for kw in change_kw) or not existing_goals
         goal_text = goal_input
@@ -222,12 +247,11 @@ JSON으로 추출해주세요:
 
 JSON만 응답해주세요.""")])
 
-    try:
-        raw    = detail_res.content.strip().removeprefix("```json").removesuffix("```").strip()
-        parsed = json.loads(raw)
-        level  = parsed.get("level", "beginner")
-        focus  = parsed.get("focus") or ""
-    except Exception:
+    parsed = parse_json(detail_res.content)
+    if parsed:
+        level = parsed.get("level", "beginner")
+        focus = parsed.get("focus") or ""
+    else:
         level = "beginner"
         focus = ""
 
@@ -266,12 +290,8 @@ JSON으로 분석해주세요:
 
 JSON만 응답해주세요.""")])
 
-    try:
-        domain = json.loads(
-            domain_res.content.strip()
-            .removeprefix("```json").removesuffix("```").strip()
-        )
-    except Exception:
+    domain = parse_json(domain_res.content)
+    if not domain:
         domain = {
             "domain": "general", "subject": new_goal,
             "level": user_level, "learning_style": "mixed",
@@ -282,7 +302,9 @@ JSON만 응답해주세요.""")])
     curriculum_res = llm.invoke([HumanMessage(content=f"""주제: {domain['subject']}
 레벨: {domain['level']} / 학습 방식: {domain['learning_style']} / 총 기간: {domain['estimated_weeks']}주
 
-JSON으로 만들어주세요:
+아래 JSON 형식으로 실제 주차별 학습 커리큘럼을 만들어주세요.
+theme, topics, checkpoint는 실제 학습 내용으로 채워주세요 (예시 placeholder가 아닌 실제 값).
+
 {{
   "domain": "{domain['domain']}",
   "subject": "{domain['subject']}",
@@ -290,18 +312,19 @@ JSON으로 만들어주세요:
   "total_weeks": {domain['estimated_weeks']},
   "daily_minutes": 60,
   "phases": [
-    {{"week": 1, "theme": "주제", "topics": ["토픽1", "토픽2"], "checkpoint": "완료 기준"}}
+    {{
+      "week": 1,
+      "theme": "1주차 핵심 학습 주제 (예: 기초 개념과 환경 설정)",
+      "topics": ["첫 번째 세부 토픽", "두 번째 세부 토픽", "세 번째 세부 토픽"],
+      "checkpoint": "1주차 완료 기준 (예: 간단한 예제 실행 성공)"
+    }}
   ]
 }}
 
-JSON만 응답해주세요.""")])
+total_weeks 수만큼 phases 배열을 채워주세요. JSON만 응답해주세요.""")])
 
-    try:
-        curriculum = json.loads(
-            curriculum_res.content.strip()
-            .removeprefix("```json").removesuffix("```").strip()
-        )
-    except Exception:
+    curriculum = parse_json(curriculum_res.content)
+    if not curriculum or "phases" not in curriculum:
         curriculum = {
             "domain": domain["domain"], "subject": new_goal,
             "level": domain["level"], "total_weeks": domain["estimated_weeks"],
@@ -336,15 +359,16 @@ JSON만 응답해주세요.""")])
     tutor_persona = persona_res.content.strip()
 
     # ── 통합 메시지 (질문 없이 정보만) ─────────────────────────
-    phases_summary = "\n".join([
-        f"  {p['week']}주차: {p['theme']}"
+    phases_summary = "\n\n".join([
+        f"**{p['week']}주차** {p['theme']}\n"
+        + (f" — {' / '.join(p['topics'])}" if p.get("topics") else "")
         for p in curriculum.get("phases", [])
     ])
 
     summary_msg = (
         f"📚 **{curriculum['subject']}** 학습 플랜을 준비했어요!\n\n"
-        f"📋 일일 습관:\n{habits_text}\n\n"
-        f"📅 {curriculum['total_weeks']}주 커리큘럼 (하루 {curriculum['daily_minutes']}분):\n"
+        f"📋 **일일 습관:**\n{habits_text}\n\n"
+        f"📅 **{curriculum['total_weeks']}주 커리큘럼** (하루 {curriculum['daily_minutes']}분)\n\n\n"
         f"{phases_summary}"
     )
 
@@ -369,9 +393,9 @@ def checkin_node(state: LearnLogState) -> dict:
     streak_msg = f"🔥 {streak}일 연속 달성 중!" if streak > 0 else "🌱 오늘부터 시작이에요!"
 
     question = (
-        f"{streak_msg}\n"
+        f"{streak_msg}\n\n"
         f"오늘 목표: {active_goal}\n\n"
-        f"오늘 어떤 학습을 하셨나요? 😊\n"
+        f"오늘 어떤 학습을 하셨나요? 😊\n\n"
         f"(관련 자료가 필요하면 '검색해줘', 퀴즈로 복습하고 싶으면 '퀴즈'를 포함해주세요)"
     )
 
@@ -410,11 +434,19 @@ def resource_search_node(state: LearnLogState) -> dict:
         results = tavily_search.invoke(query)
         if isinstance(results, str):
             formatted = results
+        elif isinstance(results, list):
+            lines = []
+            for r in results:
+                if isinstance(r, dict):
+                    title   = r.get("title", "")
+                    url     = r.get("url", "")
+                    content = r.get("content", "")[:120]
+                    lines.append(f"📌 {title}\n   🔗 {url}\n   {content}...")
+                else:
+                    lines.append(str(r))
+            formatted = "\n".join(lines)
         else:
-            formatted = "\n".join([
-                f"📌 {r.get('title', '')}\n   🔗 {r.get('url', '')}\n   {r.get('content', '')[:120]}..."
-                for r in results
-            ])
+            formatted = str(results)
     except Exception as e:
         error_msg = f"검색 중 오류가 발생했어요: {e}\n직접 검색해보시는 걸 추천드려요 🙏"
         return {"messages": [AIMessage(content=error_msg)], "search_results": "", "next_action": "write"}
@@ -564,7 +596,7 @@ def notion_post_node(state: LearnLogState) -> dict:
         final = (
             f"📔 오늘의 학습 일기가 Notion에 저장됐어요!\n\n"
             f"{result}\n\n"
-            f"오늘 기분 [{mood}] 이었는데도 공부하셨군요! 🌟\n"
+            f"오늘 기분 [{mood}] 이었는데도 공부하셨군요! 🌟\n\n"
             f"{streak}일 연속 달성 중이에요. 내일도 화이팅! 💪"
         )
     else:

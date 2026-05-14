@@ -17,6 +17,7 @@ from graph import (
     goal_detail_node,
     goal_setup_node,
     checkin_node,
+    quiz_generate_node,
     quiz_node,
     diary_writer_node,
     notion_post_node,
@@ -279,49 +280,69 @@ def test_checkin_saves_achievements(base_state):
     assert result["today_achievements"] == user_msg
 
 
+# ── quiz_generate_node ──────────────────────────────────────────
+
+def test_quiz_generate_node_returns_questions(state_with_search):
+    """quiz_generate_node가 quiz_questions를 state에 저장하는지"""
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response("1번 문제: StateGraph란?\n2번 문제: ...\n3번 문제: ...")
+        result = quiz_generate_node(state_with_search)
+
+    assert "quiz_questions" in result
+    assert "StateGraph" in result["quiz_questions"]
+
+
+def test_quiz_generate_node_uses_tutor_persona(state_with_search):
+    """quiz_generate_node가 tutor_persona를 SystemMessage로 사용하는지"""
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response("퀴즈 문제들...")
+        quiz_generate_node(state_with_search)
+
+    first_call_messages = mock_llm.invoke.call_args_list[0][0][0]
+    assert isinstance(first_call_messages[0], SystemMessage)
+    assert "LangGraph 전문 강사" in first_call_messages[0].content
+
+
 # ── quiz_node ───────────────────────────────────────────────────
 
 def test_quiz_node_returns_feedback_message(state_with_search):
+    """quiz_node가 state의 quiz_questions를 사용해 평가하는지"""
+    state = {**state_with_search, "quiz_questions": "1번 문제: StateGraph란?\n2번 문제: ...\n3번 문제: ..."}
+
     with patch("graph.llm") as mock_llm, \
          patch("graph.interrupt", return_value="1. StateGraph  2. 모르겠어요  3. interrupt"):
-        mock_llm.invoke.side_effect = [
-            make_llm_response("1번 문제: StateGraph란?\n2번 문제: ...\n3번 문제: ..."),
-            make_llm_response("1번 정답! 2번 아쉬워요. 전체 점수: 2/3"),
-        ]
-        result = quiz_node(state_with_search)
+        mock_llm.invoke.return_value = make_llm_response("1번 정답! 2번 아쉬워요. 전체 점수: 2/3")
+        result = quiz_node(state)
 
     assert "quiz_history" in result
     assert len(result["quiz_history"]) == 1
     assert result["quiz_history"][0]["topic"] == "LangGraph 기초"
+    assert result["quiz_questions"] == ""  # 사용 후 초기화 확인
 
 
 def test_quiz_node_appends_to_existing_history(state_with_search):
     existing = [{"date": "2026-01-01", "topic": "이전 토픽", "questions": "", "answers": "", "feedback": ""}]
-    state = {**state_with_search, "quiz_history": existing}
+    state = {**state_with_search, "quiz_history": existing, "quiz_questions": "퀴즈 문제들..."}
 
     with patch("graph.llm") as mock_llm, \
          patch("graph.interrupt", return_value="답변입니다"):
-        mock_llm.invoke.side_effect = [
-            make_llm_response("퀴즈 문제들..."),
-            make_llm_response("피드백: 잘했어요! 점수: 3/3"),
-        ]
+        mock_llm.invoke.return_value = make_llm_response("피드백: 잘했어요! 점수: 3/3")
         result = quiz_node(state)
 
     assert len(result["quiz_history"]) == 2
 
 
-def test_quiz_node_uses_tutor_persona(state_with_search):
+def test_quiz_node_uses_state_quiz_questions(state_with_search):
+    """quiz_node가 LLM을 재호출하지 않고 state의 quiz_questions를 사용하는지"""
+    state = {**state_with_search, "quiz_questions": "미리 생성된 퀴즈 문제"}
+
     with patch("graph.llm") as mock_llm, \
          patch("graph.interrupt", return_value="답변"):
-        mock_llm.invoke.side_effect = [
-            make_llm_response("퀴즈 문제들..."),
-            make_llm_response("피드백"),
-        ]
-        quiz_node(state_with_search)
+        mock_llm.invoke.return_value = make_llm_response("피드백")
+        quiz_node(state)
 
-    first_call_messages = mock_llm.invoke.call_args_list[0][0][0]
-    assert isinstance(first_call_messages[0], SystemMessage)
-    assert "LangGraph 전문 강사" in first_call_messages[0].content
+    # quiz_node는 LLM을 1번만 호출 (평가용)
+    assert mock_llm.invoke.call_count == 1
 
 
 # ── diary_writer_node ───────────────────────────────────────────

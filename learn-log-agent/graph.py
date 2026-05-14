@@ -58,6 +58,7 @@ class LearnLogState(TypedDict):
     current_topic:      str         # 오늘 학습 토픽
     tutor_persona:      str         # 동적 생성 튜터 System Prompt
     quiz_history:       List[dict]  # 퀴즈 기록 (스페이스드 리피티션용)
+    quiz_questions:     str         # 생성된 퀴즈 문제 (interrupt 재실행 방지용)
     progress_pct:       float       # 전체 진도율 (0.0 ~ 1.0)
     user_level:         str         # 사용자 학습 수준 (beginner/intermediate/advanced)
 
@@ -302,8 +303,8 @@ JSON만 응답해주세요.""")])
     curriculum_res = llm.invoke([HumanMessage(content=f"""주제: {domain['subject']}
 레벨: {domain['level']} / 학습 방식: {domain['learning_style']} / 총 기간: {domain['estimated_weeks']}주
 
-아래 JSON 형식으로 실제 주차별 학습 커리큘럼을 만들어주세요.
-theme, topics, checkpoint는 실제 학습 내용으로 채워주세요 (예시 placeholder가 아닌 실제 값).
+아래 JSON 형식으로 실제 주차별 + 일별 학습 커리큘럼을 만들어주세요.
+모든 값은 실제 학습 내용으로 채워주세요 (예시 placeholder 사용 금지).
 
 {{
   "domain": "{domain['domain']}",
@@ -314,14 +315,20 @@ theme, topics, checkpoint는 실제 학습 내용으로 채워주세요 (예시 
   "phases": [
     {{
       "week": 1,
-      "theme": "1주차 핵심 학습 주제 (예: 기초 개념과 환경 설정)",
-      "topics": ["첫 번째 세부 토픽", "두 번째 세부 토픽", "세 번째 세부 토픽"],
-      "checkpoint": "1주차 완료 기준 (예: 간단한 예제 실행 성공)"
+      "theme": "1주차 핵심 학습 주제",
+      "checkpoint": "1주차 완료 기준",
+      "days": [
+        {{"day": 1, "topic": "Day1 학습 내용"}},
+        {{"day": 2, "topic": "Day2 학습 내용"}},
+        {{"day": 3, "topic": "Day3 학습 내용"}},
+        {{"day": 4, "topic": "Day4 학습 내용"}},
+        {{"day": 5, "topic": "Day5 복습 및 정리"}}
+      ]
     }}
   ]
 }}
 
-total_weeks 수만큼 phases 배열을 채워주세요. JSON만 응답해주세요.""")])
+total_weeks 수만큼 phases를, 각 phase마다 5일치 days를 실제 내용으로 채워주세요. JSON만 응답해주세요.""")])
 
     curriculum = parse_json(curriculum_res.content)
     if not curriculum or "phases" not in curriculum:
@@ -342,7 +349,9 @@ total_weeks 수만큼 phases 배열을 채워주세요. JSON만 응답해주세�
     habits_text = habits_res.content.strip()
 
     # ── Step 4: 튜터 페르소나 생성 ──────────────────────────────
-    first_topic = curriculum["phases"][0]["theme"] if curriculum.get("phases") else new_goal
+    first_phase = curriculum["phases"][0] if curriculum.get("phases") else {}
+    first_topic = (first_phase.get("days", [{}])[0].get("topic")
+                   or first_phase.get("theme", new_goal))
 
     persona_res = llm.invoke([HumanMessage(content=f"""당신은 최고의 교육 설계자입니다.
 아래 정보를 바탕으로 AI 튜터의 시스템 프롬프트를 작성해주세요.
@@ -358,18 +367,20 @@ total_weeks 수만큼 phases 배열을 채워주세요. JSON만 응답해주세�
 - 시스템 프롬프트만 작성, 다른 설명 없이""")])
     tutor_persona = persona_res.content.strip()
 
-    # ── 통합 메시지 (질문 없이 정보만) ─────────────────────────
-    phases_summary = "\n\n".join([
-        f"**{p['week']}주차** {p['theme']}\n"
-        + (f" — {' / '.join(p['topics'])}" if p.get("topics") else "")
-        for p in curriculum.get("phases", [])
-    ])
+    # ── 통합 메시지 — 마크다운 테이블 ──────────────────────────
+    table  = "| 주차 | 주제 | 일별 학습 내용 | 완료 기준 |\n"
+    table += "|------|------|----------------|-----------|\n"
+    for p in curriculum.get("phases", []):
+        days_str = "<br>".join(
+            f"• Day{d['day']}: {d['topic']}" for d in p.get("days", [])
+        )
+        table += f"| {p['week']}주차 | {p['theme']} | {days_str} | {p.get('checkpoint', '')} |\n"
 
     summary_msg = (
         f"📚 **{curriculum['subject']}** 학습 플랜을 준비했어요!\n\n"
         f"📋 **일일 습관:**\n{habits_text}\n\n"
-        f"📅 **{curriculum['total_weeks']}주 커리큘럼** (하루 {curriculum['daily_minutes']}분)\n\n\n"
-        f"{phases_summary}"
+        f"📅 **{curriculum['total_weeks']}주 커리큘럼** (하루 {curriculum['daily_minutes']}분)\n\n"
+        f"{table}"
     )
 
     return {
@@ -389,13 +400,41 @@ def checkin_node(state: LearnLogState) -> dict:
     """노드 3: 오늘 학습 체크인 (interrupt)"""
     streak      = state.get("streak", 0)
     active_goal = get_active_goal(state)
+    curriculum  = state.get("curriculum", {})
+    prev_week   = state.get("current_week", 1)
+    new_streak  = streak + 1
+
+    # ── 진도 계산 ──────────────────────────────────────────────
+    if curriculum.get("phases"):
+        total_weeks  = curriculum.get("total_weeks", 1)
+        new_week     = min((new_streak - 1) // 7 + 1, total_weeks)
+        phases       = curriculum["phases"]
+        phase        = next((p for p in phases if p["week"] == new_week), phases[-1])
+        day_in_week  = ((new_streak - 1) % 7) + 1
+        days         = phase.get("days", [])
+        day_entry    = next((d for d in days if d["day"] == day_in_week), None)
+        new_topic    = day_entry["topic"] if day_entry else phase["theme"]
+        new_progress = round(min(new_streak / (total_weeks * 7), 1.0), 2)
+    else:
+        new_week     = prev_week
+        new_topic    = state.get("current_topic", "")
+        new_progress = state.get("progress_pct", 0.0)
+
+    # ── 주차 변경 알림 ─────────────────────────────────────────
+    week_up_msg = (
+        f"\n\n🎉 {new_week}주차 시작! 오늘부터 [{new_topic}]을 배워요!"
+        if new_week > prev_week else ""
+    )
 
     streak_msg = f"🔥 {streak}일 연속 달성 중!" if streak > 0 else "🌱 오늘부터 시작이에요!"
+    topic_line = f"📖 오늘의 주제: **{new_topic}**\n\n" if new_topic else ""
+    topic_name = new_topic if new_topic else active_goal
 
     question = (
-        f"{streak_msg}\n\n"
-        f"오늘 목표: {active_goal}\n\n"
-        f"오늘 어떤 학습을 하셨나요? 😊\n\n"
+        f"{streak_msg}{week_up_msg}\n\n"
+        f"{topic_line}"
+        f"오늘 [{topic_name}] 학습은 어떠셨나요? 😊\n\n"
+        f"배운 내용을 자유롭게 적어주세요.\n"
         f"(관련 자료가 필요하면 '검색해줘', 퀴즈로 복습하고 싶으면 '퀴즈'를 포함해주세요)"
     )
 
@@ -417,10 +456,13 @@ def checkin_node(state: LearnLogState) -> dict:
         next_action = "write"
 
     return {
-        "messages":          [HumanMessage(content=user_input)],
-        "today_achievements": user_input,
-        "streak":            streak + 1,
-        "next_action":       next_action,
+        "messages":           [HumanMessage(content=user_input)],
+        "today_achievements":  user_input,
+        "streak":              new_streak,
+        "next_action":         next_action,
+        "current_week":        new_week,
+        "current_topic":       new_topic,
+        "progress_pct":        new_progress,
     }
 
 
@@ -456,34 +498,37 @@ def resource_search_node(state: LearnLogState) -> dict:
     )])
 
     # ── 퀴즈 제안 interrupt ─────────────────────────────────────
+    current_topic = state.get("current_topic", "") or goal
+
     quiz_offer = interrupt(
         f"{response.content}\n\n"
         f"---\n"
-        f"📝 방금 찾은 자료를 바탕으로 퀴즈를 풀어볼까요? (예 / 아니요)"
+        f"📝 오늘 주제 [{current_topic}]에 대한 퀴즈를 풀어볼까요? (예 / 아니요)"
     )
 
     wants_quiz = any(kw in quiz_offer.lower() for kw in
                      ["예", "네", "응", "ㅇ", "좋아", "yes", "y", "퀴즈", "해줘"])
 
     return {
-        "messages":       [response],
+        "messages":       [],
         "search_results": formatted,
         "next_action":    "quiz" if wants_quiz else "write",
     }
 
 
-def quiz_node(state: LearnLogState) -> dict:
-    """노드 4-2: 오늘 학습 내용 기반 퀴즈 (interrupt)"""
+def quiz_generate_node(state: LearnLogState) -> dict:
+    """노드 4-2a: 퀴즈 문제 생성 (LLM만, interrupt 없음)
+    interrupt 재실행 시 LLM이 재호출되어 문제가 바뀌는 문제를 방지하기 위해
+    quiz_node에서 분리. 생성된 문제는 state에 저장.
+    """
     tutor_persona = state.get("tutor_persona", "")
     goal          = get_active_goal(state)
     achievements  = state.get("today_achievements", "") or goal
     current_topic = state.get("current_topic", goal)
-    quiz_history  = state.get("quiz_history", [])
 
     system = (SystemMessage(content=tutor_persona) if tutor_persona
               else SystemMessage(content=f"당신은 {goal} 전문 튜터입니다."))
 
-    # ── Step 1: 퀴즈 문제 생성 ─────────────────────────────────
     question_prompt = HumanMessage(content=f"""오늘 학습한 내용을 바탕으로 퀴즈 3문제를 만들어주세요.
 
 오늘 학습 주제: {current_topic}
@@ -492,19 +537,33 @@ def quiz_node(state: LearnLogState) -> dict:
 요구사항:
 - 핵심 개념을 확인할 수 있는 질문
 - 단계적 난이도 (쉬움 → 보통 → 어려움)
-- 번호를 붙여 명확하게 구분
+- 번호를 붙여 명확하게 구분하고 난이도는 질문 맨 뒤에 이어붙여주세요.
 
 퀴즈만 제시하고 답은 포함하지 마세요.""")
 
     quiz_questions = llm.invoke([system, question_prompt]).content
 
-    # ── Step 2: interrupt — 사용자 답변 대기 ─────────────────
+    return {"quiz_questions": quiz_questions}
+
+
+def quiz_node(state: LearnLogState) -> dict:
+    """노드 4-2b: 퀴즈 제시 (interrupt) + 답변 평가"""
+    tutor_persona  = state.get("tutor_persona", "")
+    goal           = get_active_goal(state)
+    current_topic  = state.get("current_topic", goal)
+    quiz_history   = state.get("quiz_history", [])
+    quiz_questions = state.get("quiz_questions", "")  # quiz_generate_node에서 저장한 문제
+
+    system = (SystemMessage(content=tutor_persona) if tutor_persona
+              else SystemMessage(content=f"당신은 {goal} 전문 튜터입니다."))
+
+    # ── Step 1: interrupt — 사용자 답변 대기 (LLM 호출 없음) ──
     user_answers = interrupt(
         f"📝 오늘의 퀴즈입니다!\n\n{quiz_questions}\n\n"
         f"위 문제들에 답해주세요. 모르는 건 '모르겠어요'라고 써도 괜찮아요 😊"
     )
 
-    # ── Step 3: 답변 평가 + 피드백 ────────────────────────────
+    # ── Step 2: 답변 평가 + 피드백 ────────────────────────────
     eval_prompt = HumanMessage(content=f"""퀴즈 문제:
 {quiz_questions}
 
@@ -520,7 +579,7 @@ def quiz_node(state: LearnLogState) -> dict:
 
     eval_res = llm.invoke([system, eval_prompt])
 
-    # ── Step 4: quiz_history 업데이트 ─────────────────────────
+    # ── Step 3: quiz_history 업데이트 ─────────────────────────
     new_record = {
         "date":      date.today().isoformat(),
         "topic":     current_topic,
@@ -530,8 +589,9 @@ def quiz_node(state: LearnLogState) -> dict:
     }
 
     return {
-        "messages":    [AIMessage(content=eval_res.content)],
+        "messages":     [AIMessage(content=eval_res.content)],
         "quiz_history": quiz_history + [new_record],
+        "quiz_questions": "",  # 사용 후 초기화
     }
 
 
@@ -647,6 +707,7 @@ def build_graph():
     builder.add_node("goal_setup",      goal_setup_node)
     builder.add_node("checkin",         checkin_node)
     builder.add_node("resource_search", resource_search_node)
+    builder.add_node("quiz_generate",   quiz_generate_node)
     builder.add_node("quiz",            quiz_node)
     builder.add_node("diary_writer",    diary_writer_node)
     builder.add_node("notion_post",     notion_post_node)
@@ -669,7 +730,7 @@ def build_graph():
         route_after_checkin,
         {
             "resource_search": "resource_search",
-            "quiz":            "quiz",
+            "quiz":            "quiz_generate",
             "diary_writer":    "diary_writer",
         },
     )
@@ -677,10 +738,11 @@ def build_graph():
     builder.add_conditional_edges(
         "resource_search",
         route_after_resource_search,
-        {"quiz": "quiz", "diary_writer": "diary_writer"},
+        {"quiz": "quiz_generate", "diary_writer": "diary_writer"},
     )
 
-    builder.add_edge("quiz",         "diary_writer")
+    builder.add_edge("quiz_generate", "quiz")
+    builder.add_edge("quiz",          "diary_writer")
     builder.add_edge("diary_writer", "notion_post")
     builder.add_edge("notion_post",  END)
 

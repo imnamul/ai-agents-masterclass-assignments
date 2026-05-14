@@ -18,6 +18,7 @@ def base_state():
         "current_topic":      "",
         "tutor_persona":      "",
         "quiz_history":       [],
+        "quiz_questions":     "",
         "progress_pct":       0.0,
         "user_level":         "",
     }

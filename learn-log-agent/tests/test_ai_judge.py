@@ -6,8 +6,16 @@ AI-as-judge 품질 테스트 — 실제 LLM 호출 (비용 발생)
 """
 import json
 import pytest
+from unittest.mock import patch
 from langchain_core.messages import HumanMessage
-from graph import llm, goal_analysis_node, diary_writer_node
+from graph import (
+    llm,
+    parse_json,
+    goal_setup_node,
+    checkin_node,
+    quiz_generate_node,
+    diary_writer_node,
+)
 
 pytestmark = pytest.mark.ai_judge
 
@@ -31,16 +39,17 @@ JSON으로 응답해주세요:
 JSON만 응답해주세요."""
 
     res = llm.invoke([HumanMessage(content=prompt)])
-    return json.loads(
-        res.content.strip().removeprefix("```json").removesuffix("```").strip()
-    )
+    result = parse_json(res.content)
+    if result is None:
+        pytest.fail(f"judge 응답 파싱 실패: {res.content}")
+    return result
 
 
-# ── goal_analysis_node 품질 테스트 ─────────────────────────────
+# ── goal_setup_node 품질 테스트 ────────────────────────────────
 
 def test_curriculum_covers_topic(state_with_goal):
     """생성된 커리큘럼이 학습 목표를 충분히 커버하는지"""
-    result        = goal_analysis_node(state_with_goal)
+    result         = goal_setup_node(state_with_goal)
     curriculum_str = json.dumps(result["curriculum"], ensure_ascii=False)
 
     verdict = ai_judge(
@@ -56,7 +65,7 @@ def test_curriculum_covers_topic(state_with_goal):
 
 def test_tutor_persona_is_domain_specific(state_with_goal):
     """생성된 튜터 페르소나가 도메인에 맞게 전문적인지"""
-    result = goal_analysis_node(state_with_goal)
+    result = goal_setup_node(state_with_goal)
 
     verdict = ai_judge(
         criteria=(
@@ -69,7 +78,44 @@ def test_tutor_persona_is_domain_specific(state_with_goal):
     assert verdict["score"] >= 3
 
 
-# ── diary_writer_node 품질 테스트 ──────────────────────────────
+# ── checkin_node 품질 테스트 ───────────────────────────────────
+
+def test_checkin_response_is_encouraging(state_with_diary):
+    """체크인 튜터 응답이 학습 주제와 관련 있고 격려하는가"""
+    with patch("graph.interrupt", return_value="interrupt()와 Command(resume)을 공부했어요"):
+        result = checkin_node(state_with_diary)
+    response_text = result["messages"][0].content if result.get("messages") else ""
+
+    verdict = ai_judge(
+        criteria=(
+            "이 튜터 응답이 학습자의 오늘 성취('interrupt()와 Command(resume) 공부')를 "
+            "인정하고, 다음 학습을 격려하며, LangGraph 주제에 맞는 구체적인 피드백을 주는가?"
+        ),
+        content=response_text,
+    )
+    assert verdict["passed"], f"체크인 응답 품질 미달: {verdict['reason']}"
+    assert verdict["score"] >= 3
+
+
+# ── quiz_generate_node 품질 테스트 ────────────────────────────
+
+def test_quiz_questions_are_relevant(state_with_search):
+    """퀴즈 문제가 학습 주제에 맞고 명확한가"""
+    result = quiz_generate_node(state_with_search)
+    questions = result.get("quiz_questions", "")
+
+    verdict = ai_judge(
+        criteria=(
+            "이 퀴즈 문제들이 'LangGraph 기초' 주제에 적합하고, "
+            "질문이 명확하며, 학습자가 답변할 수 있는 수준인가?"
+        ),
+        content=questions,
+    )
+    assert verdict["passed"], f"퀴즈 품질 미달: {verdict['reason']}"
+    assert verdict["score"] >= 3
+
+
+# ── diary_writer_node 품질 테스트 ─────────────────────────────
 
 def test_diary_reflects_mood_and_achievements(state_with_diary):
     """일기가 기분과 성취를 자연스럽게 반영하는지"""

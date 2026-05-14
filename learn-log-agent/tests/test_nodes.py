@@ -21,6 +21,7 @@ from graph import (
     quiz_node,
     diary_writer_node,
     notion_post_node,
+    _get_review_topics,
 )
 
 
@@ -280,6 +281,48 @@ def test_checkin_saves_achievements(base_state):
     assert result["today_achievements"] == user_msg
 
 
+# ── _get_review_topics ──────────────────────────────────────────
+
+def test_get_review_topics_empty_history():
+    """quiz_history가 비어있으면 빈 리스트 반환"""
+    assert _get_review_topics([], "오늘 주제") == []
+
+
+def test_get_review_topics_detects_weak_topic():
+    """피드백에 부정 키워드가 있으면 약점 토픽으로 감지"""
+    history = [{"date": "2026-05-01", "topic": "API 활용", "feedback": "2번 아쉬워요. 점수: 1/3", "questions": "", "answers": ""}]
+    result = _get_review_topics(history, "오늘 주제")
+    assert len(result) == 1
+    assert result[0]["topic"] == "API 활용"
+    assert result[0]["is_weak"] is True
+
+
+def test_get_review_topics_detects_old_topic():
+    """3일 이상 지난 토픽은 복습 대상"""
+    history = [{"date": "2020-01-01", "topic": "기초 개념", "feedback": "완벽해요!", "questions": "", "answers": ""}]
+    result = _get_review_topics(history, "오늘 주제")
+    assert len(result) == 1
+    assert result[0]["topic"] == "기초 개념"
+    assert result[0]["is_weak"] is False
+
+
+def test_get_review_topics_excludes_current_topic():
+    """오늘 주제와 같은 항목은 제외"""
+    history = [{"date": "2020-01-01", "topic": "오늘 주제", "feedback": "아쉬워요", "questions": "", "answers": ""}]
+    result = _get_review_topics(history, "오늘 주제")
+    assert result == []
+
+
+def test_get_review_topics_max_two():
+    """최대 2개까지만 반환"""
+    history = [
+        {"date": "2020-01-01", "topic": f"토픽{i}", "feedback": "아쉬워요", "questions": "", "answers": ""}
+        for i in range(5)
+    ]
+    result = _get_review_topics(history, "오늘 주제")
+    assert len(result) <= 2
+
+
 # ── quiz_generate_node ──────────────────────────────────────────
 
 def test_quiz_generate_node_returns_questions(state_with_search):
@@ -404,3 +447,41 @@ def test_notion_post_failure_message(state_with_diary):
         result = notion_post_node(state_with_diary)
 
     assert "실패" in result["messages"][0].content
+
+
+# ── _get_review_topics ──────────────────────────────────────────
+
+def test_get_review_topics_empty_history():
+    assert _get_review_topics([], "오늘 주제") == []
+
+
+def test_get_review_topics_detects_weak_topic():
+    history = [{"date": "2026-05-01", "topic": "API 활용", "feedback": "2번 아쉬워요. 점수: 1/3"}]
+    result = _get_review_topics(history, "오늘 주제")
+    assert len(result) == 1
+    assert result[0]["topic"] == "API 활용"
+    assert result[0]["is_weak"] is True
+
+
+def test_get_review_topics_detects_old_topic():
+    history = [{"date": "2026-05-01", "topic": "StateGraph 기초", "feedback": "잘했어요! 점수: 3/3"}]
+    result = _get_review_topics(history, "오늘 주제")
+    assert len(result) == 1
+    assert result[0]["topic"] == "StateGraph 기초"
+    assert result[0]["days_ago"] >= 3
+
+
+def test_get_review_topics_excludes_current_topic():
+    history = [{"date": "2026-05-01", "topic": "오늘 주제", "feedback": "아쉬워요"}]
+    result = _get_review_topics(history, "오늘 주제")
+    assert result == []
+
+
+def test_get_review_topics_max_two():
+    history = [
+        {"date": "2026-05-01", "topic": "주제A", "feedback": "아쉬워요"},
+        {"date": "2026-05-02", "topic": "주제B", "feedback": "틀렸어요"},
+        {"date": "2026-05-03", "topic": "주제C", "feedback": "아쉬워요"},
+    ]
+    result = _get_review_topics(history, "오늘 주제")
+    assert len(result) <= 2

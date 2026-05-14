@@ -516,28 +516,93 @@ def resource_search_node(state: LearnLogState) -> dict:
     }
 
 
+def _get_review_topics(quiz_history: list, current_topic: str) -> list[dict]:
+    """quiz_history에서 복습이 필요한 토픽을 추출 (스페이스드 리피티션)
+
+    복습 조건:
+    - 약점: 피드백에 부정 키워드가 포함된 항목
+    - 오래됨: 마지막 퀴즈로부터 3일 이상 지난 항목
+    오늘 주제와 중복되는 항목은 제외.
+    """
+    if not quiz_history:
+        return []
+
+    weak_keywords = ["아쉬워요", "틀렸", "모르겠", "incorrect", "wrong", "오답", "아쉽"]
+    today         = date.today()
+    seen_topics   = set()
+    review_topics = []
+
+    for record in reversed(quiz_history):  # 최근 기록부터
+        topic = record.get("topic", "")
+        if topic == current_topic or topic in seen_topics:
+            continue
+        seen_topics.add(topic)
+
+        feedback     = record.get("feedback", "").lower()
+        record_date  = record.get("date", "")
+        is_weak      = any(kw in feedback for kw in weak_keywords)
+        days_ago     = 999
+        try:
+            days_ago = (today - date.fromisoformat(record_date)).days
+        except Exception:
+            pass
+
+        if is_weak or days_ago >= 3:
+            review_topics.append({
+                "topic":    topic,
+                "days_ago": days_ago,
+                "is_weak":  is_weak,
+            })
+            if len(review_topics) >= 2:  # 최대 2개까지만
+                break
+
+    return review_topics
+
+
 def quiz_generate_node(state: LearnLogState) -> dict:
     """노드 4-2a: 퀴즈 문제 생성 (LLM만, interrupt 없음)
     interrupt 재실행 시 LLM이 재호출되어 문제가 바뀌는 문제를 방지하기 위해
     quiz_node에서 분리. 생성된 문제는 state에 저장.
+    스페이스드 리피티션: quiz_history 기반 복습 토픽을 함께 포함.
     """
     tutor_persona = state.get("tutor_persona", "")
     goal          = get_active_goal(state)
     achievements  = state.get("today_achievements", "") or goal
     current_topic = state.get("current_topic", goal)
+    quiz_history  = state.get("quiz_history", [])
 
     system = (SystemMessage(content=tutor_persona) if tutor_persona
               else SystemMessage(content=f"당신은 {goal} 전문 튜터입니다."))
 
+    # ── 복습 토픽 추출 ──────────────────────────────────────────
+    review_topics = _get_review_topics(quiz_history, current_topic)
+
+    if review_topics:
+        def _label(r):
+            return "약점 토픽" if r["is_weak"] else f"{r['days_ago']}일 전 학습"
+        review_lines = "\n".join([
+            f"- {r['topic']} ({_label(r)})"
+            for r in review_topics
+        ])
+        review_section = f"\n\n[복습이 필요한 이전 토픽]\n{review_lines}"
+        distribution   = "- 2문제: 오늘 주제\n- 1문제: 복습 토픽 중 하나"
+    else:
+        review_section = ""
+        distribution   = "- 3문제: 오늘 주제"
+
     question_prompt = HumanMessage(content=f"""오늘 학습한 내용을 바탕으로 퀴즈 3문제를 만들어주세요.
 
 오늘 학습 주제: {current_topic}
-오늘 학습 내용: {achievements}
+오늘 학습 내용: {achievements}{review_section}
+
+문제 구성:
+{distribution}
 
 요구사항:
 - 핵심 개념을 확인할 수 있는 질문
 - 단계적 난이도 (쉬움 → 보통 → 어려움)
 - 번호를 붙여 명확하게 구분하고 난이도는 질문 맨 뒤에 이어붙여주세요.
+- 복습 문제는 끝에 (복습) 표시를 붙여주세요.
 
 퀴즈만 제시하고 답은 포함하지 마세요.""")
 
@@ -679,18 +744,18 @@ def route_after_goal_check(state: LearnLogState) -> str:
 
 
 def route_after_checkin(state: LearnLogState) -> str:
-    """CE2: 'search' → resource_search / 'quiz' → quiz / 'write' → diary_writer"""
+    """CE2: 'search' → resource_search / 'quiz' → quiz_generate / 'write' → diary_writer"""
     action = state.get("next_action", "write")
     if action == "search":
         return "resource_search"
     if action == "quiz":
-        return "quiz"
+        return "quiz_generate"
     return "diary_writer"
 
 
 def route_after_resource_search(state: LearnLogState) -> str:
     """CE3: 검색 후 퀴즈 제안 결과에 따라 분기"""
-    return "quiz" if state.get("next_action") == "quiz" else "diary_writer"
+    return "quiz_generate" if state.get("next_action") == "quiz" else "diary_writer"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -730,7 +795,7 @@ def build_graph():
         route_after_checkin,
         {
             "resource_search": "resource_search",
-            "quiz":            "quiz_generate",
+            "quiz_generate":   "quiz_generate",
             "diary_writer":    "diary_writer",
         },
     )
@@ -738,13 +803,13 @@ def build_graph():
     builder.add_conditional_edges(
         "resource_search",
         route_after_resource_search,
-        {"quiz": "quiz_generate", "diary_writer": "diary_writer"},
+        {"quiz_generate": "quiz_generate", "diary_writer": "diary_writer"},
     )
 
     builder.add_edge("quiz_generate", "quiz")
     builder.add_edge("quiz",          "diary_writer")
-    builder.add_edge("diary_writer", "notion_post")
-    builder.add_edge("notion_post",  END)
+    builder.add_edge("diary_writer",  "notion_post")
+    builder.add_edge("notion_post",   END)
 
     conn   = sqlite3.connect("learnlog.db", check_same_thread=False)
     memory = SqliteSaver(conn)

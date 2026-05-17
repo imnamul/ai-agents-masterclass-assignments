@@ -11,7 +11,9 @@ from langchain_core.messages import HumanMessage
 from graph import (
     llm,
     parse_json,
-    goal_setup_node,
+    domain_analysis_node,
+    curriculum_build_node,
+    persona_build_node,
     checkin_node,
     quiz_generate_node,
     diary_writer_node,
@@ -45,11 +47,23 @@ JSON만 응답해주세요."""
     return result
 
 
-# ── goal_setup_node 품질 테스트 ────────────────────────────────
+# ── 커리큘럼 생성 품질 테스트 (domain_analysis → curriculum_build → persona_build) ──
+
+def _run_full_goal_setup(state_with_goal):
+    """3개 노드를 순서대로 실행해 커리큘럼 + 튜터 페르소나를 생성하는 헬퍼"""
+    domain_result = domain_analysis_node(state_with_goal)
+    state1 = {**state_with_goal, **domain_result}
+
+    curriculum_result = curriculum_build_node(state1)
+    state2 = {**state1, **curriculum_result}
+
+    persona_result = persona_build_node(state2)
+    return {**state2, **persona_result}
+
 
 def test_curriculum_covers_topic(state_with_goal):
     """생성된 커리큘럼이 학습 목표를 충분히 커버하는지"""
-    result         = goal_setup_node(state_with_goal)
+    result         = _run_full_goal_setup(state_with_goal)
     curriculum_str = json.dumps(result["curriculum"], ensure_ascii=False)
 
     verdict = ai_judge(
@@ -63,9 +77,26 @@ def test_curriculum_covers_topic(state_with_goal):
     assert verdict["score"] >= 3
 
 
+def test_curriculum_resources_are_included(state_with_goal):
+    """커리큘럼 각 주차에 자료 링크가 포함되는지"""
+    result = _run_full_goal_setup(state_with_goal)
+    phases = result["curriculum"].get("phases", [])
+
+    has_resources = any(
+        len(p.get("resources", [])) > 0
+        for p in phases
+    )
+    assert has_resources, "최소 한 주차 이상 resources가 있어야 합니다"
+
+    for p in phases:
+        for r in p.get("resources", []):
+            assert r.get("url", "").startswith("https://"), \
+                f"유효하지 않은 URL: {r.get('url')}"
+
+
 def test_tutor_persona_is_domain_specific(state_with_goal):
     """생성된 튜터 페르소나가 도메인에 맞게 전문적인지"""
-    result = goal_setup_node(state_with_goal)
+    result = _run_full_goal_setup(state_with_goal)
 
     verdict = ai_judge(
         criteria=(
@@ -80,21 +111,29 @@ def test_tutor_persona_is_domain_specific(state_with_goal):
 
 # ── checkin_node 품질 테스트 ───────────────────────────────────
 
-def test_checkin_response_is_encouraging(state_with_diary):
-    """체크인 튜터 응답이 학습 주제와 관련 있고 격려하는가"""
-    with patch("graph.interrupt", return_value="interrupt()와 Command(resume)을 공부했어요"):
-        result = checkin_node(state_with_diary)
-    response_text = result["messages"][0].content if result.get("messages") else ""
+def test_checkin_prompt_includes_resources(state_with_goal):
+    """checkin interrupt 질문에 학습 자료 링크가 포함되는지"""
+    curriculum = {
+        "total_weeks": 4,
+        "phases": [
+            {"week": 1, "theme": "기초", "checkpoint": "이해",
+             "days": [{"day": 1, "topic": "StateGraph"}],
+             "resources": [{"title": "LangGraph Docs",
+                            "url": "https://langchain-ai.github.io/langgraph/"}]},
+        ],
+    }
+    state = {**state_with_goal, "curriculum": curriculum, "streak": 0}
 
-    verdict = ai_judge(
-        criteria=(
-            "이 튜터 응답이 학습자의 오늘 성취('interrupt()와 Command(resume) 공부')를 "
-            "인정하고, 다음 학습을 격려하며, LangGraph 주제에 맞는 구체적인 피드백을 주는가?"
-        ),
-        content=response_text,
-    )
-    assert verdict["passed"], f"체크인 응답 품질 미달: {verdict['reason']}"
-    assert verdict["score"] >= 3
+    captured = {}
+    def capture_interrupt(question):
+        captured["question"] = question
+        return "오늘 StateGraph를 공부했어요"
+
+    with patch("graph.interrupt", side_effect=capture_interrupt):
+        checkin_node(state)
+
+    assert "langchain-ai.github.io" in captured["question"], \
+        "체크인 질문에 자료 링크가 포함되어야 합니다"
 
 
 # ── quiz_generate_node 품질 테스트 ────────────────────────────

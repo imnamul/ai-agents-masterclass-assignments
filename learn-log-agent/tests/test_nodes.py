@@ -5,7 +5,6 @@ Mock LLM 사용 — API 비용 없음
 실행:
     uv run pytest tests/test_nodes.py -v
 """
-import json
 import pytest
 from unittest.mock import patch, MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -15,7 +14,9 @@ from graph import (
     mood_node,
     goal_check_node,
     goal_detail_node,
-    goal_setup_node,
+    domain_analysis_node,
+    curriculum_build_node,
+    persona_build_node,
     checkin_node,
     quiz_generate_node,
     quiz_node,
@@ -31,6 +32,13 @@ def make_llm_response(content: str) -> MagicMock:
     mock = MagicMock()
     mock.content = content
     return mock
+
+
+def make_structured_mock(return_value):
+    """llm.with_structured_output(...).invoke(...) 체인을 모킹"""
+    structured = MagicMock()
+    structured.invoke.return_value = return_value
+    return structured
 
 
 # ── get_active_goal ─────────────────────────────────────────────
@@ -165,83 +173,144 @@ def test_goal_detail_fallback_on_json_error(state_with_goal):
     assert result["user_level"] == "beginner"
 
 
-# ── goal_setup_node ─────────────────────────────────────────────
+# ── domain_analysis_node ────────────────────────────────────────
 
-def test_goal_setup_generates_plan(state_with_goal):
-    """goal_setup_node가 curriculum, tutor_persona, 메시지를 생성하는지"""
-    domain_json = json.dumps({
+def test_domain_analysis_returns_domain_info(state_with_goal):
+    """domain_analysis_node가 domain_info dict를 반환하는지"""
+    mock_domain = MagicMock()
+    mock_domain.model_dump.return_value = {
         "domain": "programming", "subject": "LangGraph",
         "level": "intermediate", "learning_style": "hands-on",
-        "estimated_weeks": 6, "prerequisites": []
-    })
-    curriculum_json = json.dumps({
-        "domain": "programming", "subject": "LangGraph",
-        "level": "intermediate", "total_weeks": 6, "daily_minutes": 60,
-        "phases": [{"week": 1, "theme": "LangGraph 기초",
-                    "topics": ["StateGraph"], "checkpoint": "기본 그래프 만들기"}]
-    })
-    habits_str  = "1. 이론 정리 (20분)\n2. 예제 실습 (30분)\n3. 복습 (10분)"
-    persona_str = "당신은 LangGraph 전문 강사입니다."
+        "estimated_weeks": 4, "prerequisites": [],
+        "is_framework": True, "official_name": "LangGraph by LangChain",
+    }
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.with_structured_output.return_value = make_structured_mock(mock_domain)
+        result = domain_analysis_node(state_with_goal)
+
+    assert "domain_info" in result
+    assert result["domain_info"]["domain"] == "programming"
+    assert result["domain_info"]["is_framework"] is True
+
+
+def test_domain_analysis_prompt_contains_goal(state_with_goal):
+    """user_level이 LLM 프롬프트에 포함되는지"""
+    state = {**state_with_goal, "user_level": "advanced"}
+    mock_domain = MagicMock()
+    mock_domain.model_dump.return_value = {
+        "domain": "programming", "subject": "LangGraph", "level": "advanced",
+        "learning_style": "hands-on", "estimated_weeks": 4,
+        "prerequisites": [], "is_framework": False, "official_name": "",
+    }
+
+    with patch("graph.llm") as mock_llm:
+        structured = make_structured_mock(mock_domain)
+        mock_llm.with_structured_output.return_value = structured
+        domain_analysis_node(state)
+
+    prompt_content = structured.invoke.call_args[0][0][0].content
+    assert "advanced" in prompt_content
+
+
+# ── curriculum_build_node ───────────────────────────────────────
+
+def test_curriculum_build_returns_curriculum(state_with_goal):
+    """curriculum_build_node가 curriculum dict를 반환하는지"""
+    from graph import DayPlan, WeekPhase, Curriculum, ResourceLink
+    mock_curriculum = Curriculum(
+        domain="programming", subject="LangGraph",
+        level="intermediate", total_weeks=4, daily_minutes=60,
+        phases=[
+            WeekPhase(
+                week=1, theme="LangGraph 기초", checkpoint="기본 그래프 구성",
+                days=[DayPlan(day=1, topic="StateGraph 소개")],
+                resources=[ResourceLink(title="LangGraph 공식 문서",
+                                        url="https://langchain-ai.github.io/langgraph/")],
+            )
+        ],
+    )
+
+    state = {
+        **state_with_goal,
+        "domain_info": {
+            "subject": "LangGraph", "level": "intermediate",
+            "learning_style": "hands-on", "estimated_weeks": 4,
+            "domain": "programming", "is_framework": True,
+            "official_name": "LangGraph by LangChain",
+        },
+    }
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.with_structured_output.return_value = make_structured_mock(mock_curriculum)
+        result = curriculum_build_node(state)
+
+    assert "curriculum" in result
+    assert result["curriculum"]["total_weeks"] == 4
+    assert result["curriculum"]["phases"][0]["resources"][0]["url"].startswith("https://")
+
+
+# ── persona_build_node ──────────────────────────────────────────
+
+def test_persona_build_returns_tutor_persona(state_with_goal):
+    """persona_build_node가 tutor_persona와 summary 메시지를 반환하는지"""
+    curriculum = {
+        "subject": "LangGraph", "domain": "programming",
+        "level": "intermediate", "total_weeks": 4, "daily_minutes": 60,
+        "phases": [
+            {"week": 1, "theme": "기초", "checkpoint": "기본 이해",
+             "days": [{"day": 1, "topic": "StateGraph 소개"}],
+             "resources": [{"title": "LangGraph Docs",
+                            "url": "https://langchain-ai.github.io/langgraph/"}]},
+        ],
+    }
+    state = {
+        **state_with_goal,
+        "curriculum": curriculum,
+        "domain_info": {"learning_style": "hands-on"},
+    }
 
     with patch("graph.llm") as mock_llm:
         mock_llm.invoke.side_effect = [
-            make_llm_response(domain_json),
-            make_llm_response(curriculum_json),
-            make_llm_response(habits_str),
-            make_llm_response(persona_str),
+            make_llm_response("1. 매일 30분\n2. 실습 위주\n3. 복습"),
+            make_llm_response("당신은 LangGraph 전문 강사입니다."),
         ]
-        result = goal_setup_node(state_with_goal)
+        result = persona_build_node(state)
 
-    assert result["curriculum"]["total_weeks"] == 6
+    assert result["tutor_persona"] == "당신은 LangGraph 전문 강사입니다."
     assert result["current_week"] == 1
-    assert result["current_topic"] == "LangGraph 기초"
-    assert result["tutor_persona"] == persona_str
-    assert result["progress_pct"] == 0.0
-    assert result["quiz_history"] == []
+    assert result["current_topic"] == "StateGraph 소개"
+    assert len(result["messages"]) == 1
+    assert isinstance(result["messages"][0], AIMessage)
     assert "LangGraph 공부" in result["learning_goals"]
 
 
-def test_goal_setup_uses_user_level(state_with_goal):
-    """user_level이 LLM 프롬프트에 포함되는지"""
-    state = {**state_with_goal, "user_level": "advanced"}
+def test_persona_build_summary_includes_resources(state_with_goal):
+    """1주차 자료 링크가 summary 메시지에 포함되는지"""
+    curriculum = {
+        "subject": "LangGraph", "domain": "programming",
+        "level": "intermediate", "total_weeks": 4, "daily_minutes": 60,
+        "phases": [
+            {"week": 1, "theme": "기초", "checkpoint": "이해",
+             "days": [{"day": 1, "topic": "StateGraph"}],
+             "resources": [{"title": "LangGraph Docs",
+                            "url": "https://langchain-ai.github.io/langgraph/"}]},
+        ],
+    }
+    state = {**state_with_goal, "curriculum": curriculum, "domain_info": {}}
 
     with patch("graph.llm") as mock_llm:
-        mock_llm.invoke.return_value = make_llm_response("잘못된 응답")
-        goal_setup_node(state)
+        mock_llm.invoke.side_effect = [
+            make_llm_response("1. 실습\n2. 복습\n3. 정리"),
+            make_llm_response("당신은 LangGraph 튜터입니다."),
+        ]
+        result = persona_build_node(state)
 
-    first_prompt = mock_llm.invoke.call_args_list[0][0][0][0].content
-    assert "advanced" in first_prompt
-
-
-def test_goal_setup_fallback_on_json_error(state_with_goal):
-    """LLM이 잘못된 JSON 반환해도 fallback으로 처리"""
-    with patch("graph.llm") as mock_llm:
-        mock_llm.invoke.return_value = make_llm_response("잘못된 응답")
-        result = goal_setup_node(state_with_goal)
-
-    assert "curriculum" in result
-    assert result["curriculum"]["subject"] == "LangGraph 공부"
+    summary_content = result["messages"][0].content
+    assert "langchain-ai.github.io" in summary_content
 
 
 # ── checkin_node ────────────────────────────────────────────────
-
-@pytest.mark.parametrize("user_input,expected", [
-    ("오늘 LangGraph 공부했어요. 자료 찾아줘",  "search"),
-    ("관련 내용 검색해줘",                       "search"),
-    ("find some resources for me",             "search"),
-    ("퀴즈 풀고 싶어요",                         "quiz"),
-    ("오늘 배운 거 복습 quiz 해줘",              "quiz"),
-    ("오늘 공부 잘 했어요!",                     "write"),
-    ("interrupt() 개념을 이해했어요",            "write"),
-])
-def test_checkin_keyword_detection(base_state, user_input, expected):
-    state = {**base_state, "active_goal": "LangGraph", "streak": 3}
-
-    with patch("graph.interrupt", return_value=user_input):
-        result = checkin_node(state)
-
-    assert result["next_action"] == expected
-
 
 def test_checkin_streak_zero_message(base_state):
     """streak=0이면 '오늘부터 시작' 메시지"""
@@ -281,6 +350,27 @@ def test_checkin_saves_achievements(base_state):
     assert result["today_achievements"] == user_msg
 
 
+def test_checkin_prompt_includes_resources(state_with_goal):
+    """curriculum에 resources가 있으면 체크인 prompt에 포함되는지"""
+    curriculum = {
+        "total_weeks": 4,
+        "phases": [
+            {"week": 1, "theme": "기초", "checkpoint": "이해",
+             "days": [{"day": 1, "topic": "StateGraph"}],
+             "resources": [{"title": "LangGraph Docs",
+                            "url": "https://langchain-ai.github.io/langgraph/"}]},
+        ],
+    }
+    state = {**state_with_goal, "curriculum": curriculum, "streak": 0}
+
+    with patch("graph.interrupt") as mock_interrupt:
+        mock_interrupt.return_value = "공부했어요"
+        checkin_node(state)
+
+    prompt = mock_interrupt.call_args[0][0]
+    assert "langchain-ai.github.io" in prompt
+
+
 # ── _get_review_topics ──────────────────────────────────────────
 
 def test_get_review_topics_empty_history():
@@ -290,7 +380,8 @@ def test_get_review_topics_empty_history():
 
 def test_get_review_topics_detects_weak_topic():
     """피드백에 부정 키워드가 있으면 약점 토픽으로 감지"""
-    history = [{"date": "2026-05-01", "topic": "API 활용", "feedback": "2번 아쉬워요. 점수: 1/3", "questions": "", "answers": ""}]
+    history = [{"date": "2026-05-01", "topic": "API 활용",
+                "feedback": "2번 아쉬워요. 점수: 1/3", "questions": "", "answers": ""}]
     result = _get_review_topics(history, "오늘 주제")
     assert len(result) == 1
     assert result[0]["topic"] == "API 활용"
@@ -299,7 +390,8 @@ def test_get_review_topics_detects_weak_topic():
 
 def test_get_review_topics_detects_old_topic():
     """3일 이상 지난 토픽은 복습 대상"""
-    history = [{"date": "2020-01-01", "topic": "기초 개념", "feedback": "완벽해요!", "questions": "", "answers": ""}]
+    history = [{"date": "2020-01-01", "topic": "기초 개념",
+                "feedback": "완벽해요!", "questions": "", "answers": ""}]
     result = _get_review_topics(history, "오늘 주제")
     assert len(result) == 1
     assert result[0]["topic"] == "기초 개념"
@@ -308,7 +400,8 @@ def test_get_review_topics_detects_old_topic():
 
 def test_get_review_topics_excludes_current_topic():
     """오늘 주제와 같은 항목은 제외"""
-    history = [{"date": "2020-01-01", "topic": "오늘 주제", "feedback": "아쉬워요", "questions": "", "answers": ""}]
+    history = [{"date": "2020-01-01", "topic": "오늘 주제",
+                "feedback": "아쉬워요", "questions": "", "answers": ""}]
     result = _get_review_topics(history, "오늘 주제")
     assert result == []
 
@@ -316,7 +409,8 @@ def test_get_review_topics_excludes_current_topic():
 def test_get_review_topics_max_two():
     """최대 2개까지만 반환"""
     history = [
-        {"date": "2020-01-01", "topic": f"토픽{i}", "feedback": "아쉬워요", "questions": "", "answers": ""}
+        {"date": "2020-01-01", "topic": f"토픽{i}",
+         "feedback": "아쉬워요", "questions": "", "answers": ""}
         for i in range(5)
     ]
     result = _get_review_topics(history, "오늘 주제")
@@ -364,7 +458,8 @@ def test_quiz_node_returns_feedback_message(state_with_search):
 
 
 def test_quiz_node_appends_to_existing_history(state_with_search):
-    existing = [{"date": "2026-01-01", "topic": "이전 토픽", "questions": "", "answers": "", "feedback": ""}]
+    existing = [{"date": "2026-01-01", "topic": "이전 토픽",
+                 "questions": "", "answers": "", "feedback": ""}]
     state = {**state_with_search, "quiz_history": existing, "quiz_questions": "퀴즈 문제들..."}
 
     with patch("graph.llm") as mock_llm, \
@@ -447,41 +542,3 @@ def test_notion_post_failure_message(state_with_diary):
         result = notion_post_node(state_with_diary)
 
     assert "실패" in result["messages"][0].content
-
-
-# ── _get_review_topics ──────────────────────────────────────────
-
-def test_get_review_topics_empty_history():
-    assert _get_review_topics([], "오늘 주제") == []
-
-
-def test_get_review_topics_detects_weak_topic():
-    history = [{"date": "2026-05-01", "topic": "API 활용", "feedback": "2번 아쉬워요. 점수: 1/3"}]
-    result = _get_review_topics(history, "오늘 주제")
-    assert len(result) == 1
-    assert result[0]["topic"] == "API 활용"
-    assert result[0]["is_weak"] is True
-
-
-def test_get_review_topics_detects_old_topic():
-    history = [{"date": "2026-05-01", "topic": "StateGraph 기초", "feedback": "잘했어요! 점수: 3/3"}]
-    result = _get_review_topics(history, "오늘 주제")
-    assert len(result) == 1
-    assert result[0]["topic"] == "StateGraph 기초"
-    assert result[0]["days_ago"] >= 3
-
-
-def test_get_review_topics_excludes_current_topic():
-    history = [{"date": "2026-05-01", "topic": "오늘 주제", "feedback": "아쉬워요"}]
-    result = _get_review_topics(history, "오늘 주제")
-    assert result == []
-
-
-def test_get_review_topics_max_two():
-    history = [
-        {"date": "2026-05-01", "topic": "주제A", "feedback": "아쉬워요"},
-        {"date": "2026-05-02", "topic": "주제B", "feedback": "틀렸어요"},
-        {"date": "2026-05-03", "topic": "주제C", "feedback": "아쉬워요"},
-    ]
-    result = _get_review_topics(history, "오늘 주제")
-    assert len(result) <= 2

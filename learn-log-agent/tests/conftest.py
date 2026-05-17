@@ -21,6 +21,9 @@ def base_state():
         "quiz_questions":     "",
         "progress_pct":       0.0,
         "user_level":         "",
+        "entry_mode":         "",
+        "session_date":       "",
+        "domain_info":        {},
     }
 
 

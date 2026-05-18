@@ -76,16 +76,11 @@ class DayPlan(BaseModel):
     day: int
     topic: str
 
-class ResourceLink(BaseModel):
-    title: str
-    url: str
-
 class WeekPhase(BaseModel):
     week: int
     theme: str
     checkpoint: str
     days: list[DayPlan]
-    resources: list[ResourceLink] = []
 
 class Curriculum(BaseModel):
     domain: str
@@ -201,10 +196,10 @@ def post_to_notion(diary_content: str, learning_goal: str, mood: str, streak: in
             headers=headers, json=payload, timeout=10,
         )
         if res.status_code == 200:
-            return f"✅ Notion 포스팅 성공! {res.json().get('url', '')}"
-        return f"⚠️ 오류 ({res.status_code}): {res.text[:200]}"
+            return f"✅ Posted to Notion! {res.json().get('url', '')}"
+        return f"⚠️ Error ({res.status_code}): {res.text[:200]}"
     except Exception as e:
-        return f"❌ 연결 오류: {e}"
+        return f"❌ Connection error: {e}"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -368,7 +363,7 @@ Important: "LangGraph" is a Python-based AI agent workflow framework, NOT a grap
 
 
 def curriculum_build_node(state: LearnLogState) -> dict:
-    """노드 2b: 커리큘럼 생성 (Curriculum Structured Output, resources 포함)"""
+    """노드 2b: 커리큘럼 생성 (Curriculum Structured Output)"""
     domain_info    = state.get("domain_info", {})
     d_subject      = domain_info.get("subject", state.get("active_goal", ""))
     d_level        = domain_info.get("level", "beginner")
@@ -404,73 +399,9 @@ Create a detailed week-by-week, day-by-day curriculum with real content.
 - Each week must have 5 days filled with actual learning content
 - No placeholder text — write real, specific topics only
 - domain: {d_domain} / subject: {d_subject} / level: {d_level}
-- Write all content in English
-
-For each phase, include 2–3 resources in the resources field:
-- Official documentation URLs, GitHub repos, or well-known tutorial sites only
-- Omit any URL you are not certain about (use empty array if unsure)
-- All URLs must start with https:// and be real addresses
-- Example: LangGraph → https://langchain-ai.github.io/langgraph/""")])
+- Write all content in English""")])
 
     return {"curriculum": curriculum_obj.model_dump()}
-
-
-def resource_verify_node(state: LearnLogState) -> dict:
-    """Node 2c: Verify resource URLs — Tavily Extract + Search fallback (Option C)"""
-    curriculum = state.get("curriculum", {})
-    phases     = curriculum.get("phases", [])
-    tavily_key = _get_secret("TAVILY_API_KEY")
-
-    if not tavily_key or not phases:
-        return {}
-
-    try:
-        from tavily import TavilyClient
-        client = TavilyClient(api_key=tavily_key)
-    except Exception:
-        return {}
-
-    verified_phases = []
-    for phase in phases:
-        resources          = phase.get("resources", [])
-        verified_resources = []
-
-        for resource in resources:
-            url   = resource.get("url", "")
-            title = resource.get("title", "")
-            if not url:
-                continue
-
-            # Step 1: Tavily Extract — verify URL is accessible
-            try:
-                extract = client.extract(urls=[url])
-                if extract.get("results"):
-                    verified_resources.append(resource)
-                    continue
-            except Exception:
-                pass
-
-            # Step 2: Tavily Search fallback — find replacement URL
-            try:
-                query          = f"{phase.get('theme', '')} {title} official documentation"
-                search_results = tavily_search.invoke(query)
-                if isinstance(search_results, list) and search_results:
-                    top = search_results[0]
-                    if isinstance(top, dict) and top.get("url"):
-                        verified_resources.append({
-                            "title": top.get("title", title),
-                            "url":   top["url"],
-                        })
-            except Exception:
-                pass  # Both failed — drop this resource
-
-        phase_copy             = dict(phase)
-        phase_copy["resources"] = verified_resources
-        verified_phases.append(phase_copy)
-
-    curriculum_copy           = dict(curriculum)
-    curriculum_copy["phases"] = verified_phases
-    return {"curriculum": curriculum_copy}
 
 
 def curriculum_confirm_node(state: LearnLogState) -> dict:
@@ -478,12 +409,11 @@ def curriculum_confirm_node(state: LearnLogState) -> dict:
     curriculum = state.get("curriculum", {})
 
     table  = "Here's your personalized curriculum! 🎓\n\n"
-    table += "| Week | Theme | Daily Topics | Checkpoint | Study Resources |\n"
-    table += "|------|-------|--------------|------------|----------------|\n"
+    table += "| Week | Theme | Daily Topics | Checkpoint |\n"
+    table += "|------|-------|--------------|------------|\n"
     for p in curriculum.get("phases", []):
         days_str = "<br>".join(f"• Day{d['day']}: {d['topic']}" for d in p.get("days", []))
-        res_str  = "<br>".join(f"[{r['title']}]({r['url']})" for r in p.get("resources", [])) or "-"
-        table  += f"| Week {p['week']} | {p['theme']} | {days_str} | {p.get('checkpoint', '')} | {res_str} |\n"
+        table  += f"| Week {p['week']} | {p['theme']} | {days_str} | {p.get('checkpoint', '')} |\n"
 
     table += (
         "\n\nDoes this look good? Feel free to let me know if you'd like any changes "
@@ -516,16 +446,7 @@ def persona_build_node(state: LearnLogState) -> dict:
                      if new_goal and new_goal not in existing_goals
                      else existing_goals)
 
-    # ── Step 3: Daily habits ────────────────────────────────────
-    habits_res = llm.invoke([HumanMessage(content=
-        f"Learning goal: {new_goal}\n"
-        f"Level: {user_level}\n"
-        f"Daily study time: {curriculum.get('daily_minutes', 60)} minutes\n\n"
-        f"List 3 simple daily habits to build this skill. Output a numbered list only, in English."
-    )])
-    habits_text = habits_res.content.strip()
-
-    # ── Step 4: Tutor persona ───────────────────────────────────
+    # ── Tutor persona ───────────────────────────────────────────
     first_phase = curriculum.get("phases", [{}])[0] if curriculum.get("phases") else {}
     first_topic = (first_phase.get("days", [{}])[0].get("topic")
                    or first_phase.get("theme", new_goal))
@@ -546,22 +467,19 @@ Requirements:
 - Output the system prompt only, no extra explanation""")])
     tutor_persona = persona_res.content.strip()
 
-    # ── Summary message — markdown table with resources ─────────
-    table  = "| Week | Theme | Daily Topics | Checkpoint | Study Resources |\n"
-    table += "|------|-------|--------------|------------|----------------|\n"
+    # ── Summary message — markdown table ─────────────────────────
+    table  = "| Week | Theme | Daily Topics | Checkpoint |\n"
+    table += "|------|-------|--------------|------------|\n"
     for p in curriculum.get("phases", []):
         days_str = "<br>".join(
             f"• Day{d['day']}: {d['topic']}" for d in p.get("days", [])
         )
-        week_res = p.get("resources", [])
-        res_str  = "<br>".join(f"[{r['title']}]({r['url']})" for r in week_res) if week_res else "-"
-        table += f"| Week {p['week']} | {p['theme']} | {days_str} | {p.get('checkpoint', '')} | {res_str} |\n"
+        table += f"| Week {p['week']} | {p['theme']} | {days_str} | {p.get('checkpoint', '')} |\n"
 
     summary_msg = (
-        f"📚 Your **{curriculum.get('subject', new_goal)}** learning plan is ready!\n\n"
-        f"📋 **Daily Habits:**\n{habits_text}\n\n"
-        f"📅 **{curriculum.get('total_weeks', 4)}-Week Curriculum** ({curriculum.get('daily_minutes', 60)} min/day)\n\n"
-        f"{table}"
+        f"✅ Great! Your **{curriculum.get('subject', new_goal)}** learning plan is all set.\n\n"
+        f"📅 {curriculum.get('total_weeks', 4)} weeks · {curriculum.get('daily_minutes', 60)} min/day\n\n"
+        f"Let's kick off **Week 1** with today's topic: **{first_topic}** 🚀"
     )
 
     return {
@@ -574,6 +492,49 @@ Requirements:
         "progress_pct":  0.0,
         "quiz_history":  [],
     }
+
+
+def checkin_topic_node(state: LearnLogState) -> dict:
+    """노드 3a: 오늘 토픽 계산 + Tavily 검색 (interrupt 없음)"""
+    streak     = state.get("streak", 0)
+    curriculum = state.get("curriculum", {})
+    new_streak = streak + 1
+
+    if curriculum.get("phases"):
+        total_weeks = curriculum.get("total_weeks", 1)
+        new_week    = min((new_streak - 1) // 7 + 1, total_weeks)
+        phases      = curriculum["phases"]
+        phase       = next((p for p in phases if p["week"] == new_week), phases[-1])
+        day_in_week = ((new_streak - 1) % 7) + 1
+        days        = phase.get("days", [])
+        day_entry   = next((d for d in days if d["day"] == day_in_week), None)
+        new_topic   = day_entry["topic"] if day_entry else phase["theme"]
+    else:
+        new_topic = state.get("current_topic", "")
+
+    active_goal    = get_active_goal(state)
+    search_results = ""
+    if new_topic and tavily_search:
+        try:
+            query   = f"{active_goal} {new_topic} tutorial guide"
+            results = tavily_search.invoke(query)
+            # TavilySearch returns Dict{"query":..., "results":[...]}
+            if isinstance(results, dict) and "results" in results:
+                items = results["results"]
+            elif isinstance(results, list):
+                items = results
+            else:
+                items = []
+            lines = [
+                f"[{r.get('title', '')}]({r.get('url', '')})"
+                for r in items
+                if isinstance(r, dict) and r.get("title") and r.get("url")
+            ]
+            search_results = "\n".join(lines[:3])
+        except Exception:
+            pass
+
+    return {"search_results": search_results}
 
 
 def checkin_node(state: LearnLogState) -> dict:
@@ -606,16 +567,6 @@ def checkin_node(state: LearnLogState) -> dict:
         if new_week > prev_week else ""
     )
 
-    # ── Current week study resources ───────────────────────────
-    if curriculum.get("phases"):
-        cur_phase   = next((p for p in curriculum["phases"] if p["week"] == new_week),
-                           curriculum["phases"][-1])
-        resources   = cur_phase.get("resources", [])
-        resource_lines = "\n".join(f"🔗 [{r['title']}]({r['url']})" for r in resources)
-        resource_section = f"\n\n📚 Study Resources:\n{resource_lines}\n" if resource_lines else ""
-    else:
-        resource_section = ""
-
     streak_msg = f"🔥 {streak} day streak!" if streak > 0 else "🌱 Let's start your first day!"
     topic_line = f"📖 Today's topic: **{new_topic}**\n" if new_topic else ""
     topic_name = new_topic if new_topic else active_goal
@@ -623,8 +574,7 @@ def checkin_node(state: LearnLogState) -> dict:
     question = (
         f"{streak_msg}{week_up_msg}\n\n"
         f"{topic_line}"
-        f"{resource_section}\n"
-        f"After studying the resources, share what you learned about [{topic_name}] today. 😊"
+        f"Share what you learned about [{topic_name}] today. 😊"
     )
 
     user_input = interrupt(question)
@@ -641,7 +591,7 @@ def checkin_node(state: LearnLogState) -> dict:
 
 def checkin_response_node(state: LearnLogState) -> dict:
     """노드 3b: 튜터 응답 생성 (LLM only, no interrupt)"""
-    tutor_persona    = state.get("tutor_persona", "당신은 친절한 학습 튜터입니다.")
+    tutor_persona    = state.get("tutor_persona", "You are a friendly learning tutor.")
     today_achievements = state.get("today_achievements", "")
     current_topic    = state.get("current_topic", "")
     active_goal      = get_active_goal(state)
@@ -674,15 +624,23 @@ def resource_search_node(state: LearnLogState) -> dict:
     """노드 4: Tavily로 학습 자료 검색 + 퀴즈 여부 확인 (interrupt)"""
     goal         = get_active_goal(state)
     achievements = state.get("today_achievements", "")
-    query        = f"{goal} {achievements} 학습 자료".strip()
+    query        = f"{goal} {achievements} learning resources tutorial".strip()
 
     try:
         results = tavily_search.invoke(query)
-        if isinstance(results, str):
-            formatted = results
+        # TavilySearch returns Dict{"query":..., "results":[...]}
+        if isinstance(results, dict) and "results" in results:
+            raw_list = results["results"]
         elif isinstance(results, list):
+            raw_list = results
+        elif isinstance(results, str):
+            raw_list = []
+            formatted = results
+        else:
+            raw_list = []
+        if isinstance(results, (dict, list)):
             lines = []
-            for r in results:
+            for r in raw_list:
                 if isinstance(r, dict):
                     title   = r.get("title", "")
                     url     = r.get("url", "")
@@ -694,7 +652,7 @@ def resource_search_node(state: LearnLogState) -> dict:
         else:
             formatted = str(results)
     except Exception as e:
-        error_msg = f"검색 중 오류가 발생했어요: {e}\n직접 검색해보시는 걸 추천드려요 🙏"
+        error_msg = f"Search failed: {e}\nPlease try searching directly. 🙏"
         return {"messages": [AIMessage(content=error_msg)], "search_results": "", "next_action": "write"}
 
     response = llm.invoke([SystemMessage(
@@ -731,7 +689,7 @@ def _get_review_topics(quiz_history: list, current_topic: str) -> list[dict]:
     if not quiz_history:
         return []
 
-    weak_keywords = ["아쉬워요", "틀렸", "모르겠", "incorrect", "wrong", "오답", "아쉽"]
+    weak_keywords = ["incorrect", "wrong", "not sure", "don't know", "mistake", "error", "missed"]
     today         = date.today()
     seen_topics   = set()
     review_topics = []
@@ -776,7 +734,7 @@ def quiz_generate_node(state: LearnLogState) -> dict:
     quiz_history  = state.get("quiz_history", [])
 
     system = (SystemMessage(content=tutor_persona) if tutor_persona
-              else SystemMessage(content=f"당신은 {goal} 전문 튜터입니다."))
+              else SystemMessage(content=f"You are an expert tutor for {goal}."))
 
     # ── 복습 토픽 추출 ──────────────────────────────────────────
     review_topics = _get_review_topics(quiz_history, current_topic)
@@ -825,7 +783,7 @@ def quiz_node(state: LearnLogState) -> dict:
     quiz_questions = state.get("quiz_questions", "")  # quiz_generate_node에서 저장한 문제
 
     system = (SystemMessage(content=tutor_persona) if tutor_persona
-              else SystemMessage(content=f"당신은 {goal} 전문 튜터입니다."))
+              else SystemMessage(content=f"You are an expert tutor for {goal}."))
 
     # ── Step 1: interrupt — wait for user answers (no LLM call) ─
     user_answers = interrupt(
@@ -867,10 +825,10 @@ At the end, give the total score (X/3) and suggest a topic to review next.""")
 
 def diary_writer_node(state: LearnLogState) -> dict:
     """노드 5: 기분 + 성취를 묶어 일기 작성"""
-    today        = date.today().strftime("%Y년 %m월 %d일")
-    mood         = state.get("mood", "") or "평온한 하루"
+    today        = date.today().strftime("%B %d, %Y")
+    mood         = state.get("mood", "") or "a calm day"
     goal         = get_active_goal(state)
-    achievements = state.get("today_achievements", "") or "오늘의 학습을 기록하지 않았어요"
+    achievements = state.get("today_achievements", "") or "No learning recorded for today"
     streak       = state.get("streak", 0)
 
     prompt = f"""Write today's learning journal entry in English.
@@ -929,12 +887,12 @@ def notion_post_node(state: LearnLogState) -> dict:
     """노드 6: 일기를 Notion에 포스팅"""
     diary  = state.get("diary_content", "")
     goal   = get_active_goal(state)
-    mood   = state.get("mood", "") or "평온한 하루"
+    mood   = state.get("mood", "") or "a calm day"
     streak = state.get("streak", 0)
 
     if not diary:
         return {
-                "messages": [AIMessage(content="일기 내용이 없어서 Notion 저장을 건너뛰었어요.")],
+                "messages": [AIMessage(content="No diary content found, skipping Notion save.")],
                 "session_date": date.today().isoformat(),   
                 }
 
@@ -1012,9 +970,9 @@ def build_graph():
     builder.add_node("goal_detail",      goal_detail_node)
     builder.add_node("domain_analysis",  domain_analysis_node)
     builder.add_node("curriculum_build", curriculum_build_node)
-    builder.add_node("resource_verify",    resource_verify_node)
     builder.add_node("curriculum_confirm", curriculum_confirm_node)
     builder.add_node("persona_build",      persona_build_node)
+    builder.add_node("checkin_topic",     checkin_topic_node)
     builder.add_node("checkin",          checkin_node)
     builder.add_node("checkin_response", checkin_response_node)
     builder.add_node("checkin_action",   checkin_action_node)
@@ -1030,7 +988,7 @@ def build_graph():
     builder.add_conditional_edges(
         START,
         route_entry,
-        {"checkin": "checkin", "full": "mood_check"},
+        {"checkin": "checkin_topic", "full": "mood_check"},
     )
 
     # 목표 설정 경로
@@ -1042,16 +1000,16 @@ def build_graph():
     )
     builder.add_edge("goal_detail",     "domain_analysis")
     builder.add_edge("domain_analysis", "curriculum_build")
-    builder.add_edge("curriculum_build",  "resource_verify")
-    builder.add_edge("resource_verify",   "curriculum_confirm")
+    builder.add_edge("curriculum_build", "curriculum_confirm")
     builder.add_conditional_edges(
         "curriculum_confirm",
         route_after_curriculum_confirm,
         {"persona_build": "persona_build", "curriculum_build": "curriculum_build"},
     )
-    builder.add_edge("persona_build", "checkin")
+    builder.add_edge("persona_build", "checkin_topic")
 
     # 체크인 경로
+    builder.add_edge("checkin_topic",    "checkin")
     builder.add_edge("checkin",          "checkin_response")
     builder.add_edge("checkin_response", "checkin_action")
     builder.add_conditional_edges(

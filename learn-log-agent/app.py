@@ -46,6 +46,7 @@ with st.sidebar:
     current_topic  = vals.get("current_topic", "")
     progress_pct   = vals.get("progress_pct", 0.0)
     total_weeks    = vals.get("curriculum", {}).get("total_weeks", 0)
+    search_results = vals.get("search_results", "")
 
     if active_goal:
         st.subheader("🎯 Current Goal")
@@ -57,16 +58,11 @@ with st.sidebar:
             st.caption(f"{int(progress_pct * 100)}% complete · Week {current_week} / {total_weeks} weeks")
             if current_topic:
                 st.info(f"📖 **Today's Topic**\n\n{current_topic}")
-            # Current week study resources
-            phases = vals.get("curriculum", {}).get("phases", [])
-            cur_phase = next((p for p in phases if p.get("week") == current_week), None)
-            if cur_phase:
-                resources = cur_phase.get("resources", [])
-                if resources:
-                    st.caption("📚 Study Resources")
-                    for r in resources:
-                        st.markdown(f"🔗 [{r['title']}]({r['url']})")
-
+            if search_results:
+                st.caption("📚 Today's Resources")
+                for _res_line in search_results.strip().split("\n"):
+                    if _res_line.strip():
+                        st.markdown(_res_line)
     if streak:
         st.metric("🔥 Streak", f"{streak} day streak")
 
@@ -153,12 +149,18 @@ for msg in new_graph_msgs:
         st.session_state.chat_log.append({"role": "assistant", "content": msg.content})
 st.session_state.synced_msg_count = len(graph_msgs)
 
-# ── Detect current interrupt → append to chat_log ───────────────
+# ── Detect current interrupt ────────────────────────────────────
 current_interrupt = None
 if is_running and graph_state.tasks:
     for task in graph_state.tasks:
         for intr in task.interrupts:
             current_interrupt = intr.value
+
+# Fallback: infer from graph_state.next when task.interrupts is empty
+if current_interrupt is None and is_running:
+    pending = set(graph_state.next or [])
+    if "diary_confirm" in pending:
+        current_interrupt = "__DIARY_CONFIRM__"
 
 # Sentinel strings that should NOT appear as chat bubbles
 _SILENT_INTERRUPTS = {"__ACTION_SELECT__", "__DIARY_ACTION__", "__DIARY_CONFIRM__"}
@@ -167,6 +169,36 @@ if current_interrupt and current_interrupt not in _SILENT_INTERRUPTS:
     last = st.session_state.chat_log[-1] if st.session_state.chat_log else None
     if not last or last["content"] != current_interrupt:
         st.session_state.chat_log.append({"role": "assistant", "content": current_interrupt})
+
+# ── _resume helper (defined early so diary confirm can use it) ───
+def _resume(value: str):
+    """Resume graph — show per-node progress during curriculum generation"""
+    _progress_labels = {
+        "domain_analysis":    "📊 Analyzing domain...",
+        "curriculum_build":   "📅 Building curriculum...",
+        "curriculum_confirm": "📋 Preparing curriculum preview...",
+        "persona_build":      "🎓 Setting up AI tutor...",
+    }
+    with st.spinner("Thinking..."):
+        _placeholder = st.empty()
+        for _event in learnlog_graph.stream(
+            Command(resume=value),
+            config=config,
+            stream_mode="updates",
+        ):
+            _node = next(iter(_event), "")
+            if _node in _progress_labels:
+                _placeholder.info(_progress_labels[_node])
+        _placeholder.empty()
+    st.rerun()
+
+# ── Auto-scroll to bottom when diary confirm is active ──────────
+if is_running and current_interrupt and "__DIARY_CONFIRM__" in current_interrupt:
+    st.components.v1.html("""<script>
+        setTimeout(function() {
+            window.parent.document.querySelector('.main').scrollTo(0, 999999);
+        }, 300);
+    </script>""", height=0)
 
 # ── Render chat ─────────────────────────────────────────────────
 for msg in st.session_state.chat_log:
@@ -186,28 +218,6 @@ if is_done:
         st.rerun()
 
 elif is_running:
-    def _resume(value: str):
-        """Resume graph — show per-node progress during curriculum generation"""
-        _progress_labels = {
-            "domain_analysis":    "📊 Analyzing domain...",
-            "curriculum_build":   "📅 Building curriculum...",
-            "resource_verify":    "🔗 Verifying resource links...",
-            "curriculum_confirm": "📋 Preparing curriculum preview...",
-            "persona_build":      "🎓 Setting up AI tutor...",
-        }
-        with st.spinner("Thinking..."):
-            _placeholder = st.empty()
-            for _event in learnlog_graph.stream(
-                Command(resume=value),
-                config=config,
-                stream_mode="updates",
-            ):
-                _node = next(iter(_event), "")
-                if _node in _progress_labels:
-                    _placeholder.info(_progress_labels[_node])
-            _placeholder.empty()
-        st.rerun()
-
     if current_interrupt == "__ACTION_SELECT__":
         st.markdown("**What would you like to do next?**")
         col1, col2 = st.columns(2)

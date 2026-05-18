@@ -902,7 +902,27 @@ Format:
 Close with a warm, encouraging message in English."""
 
     response = llm.invoke([SystemMessage(content=prompt)])
-    return {"messages": [response], "diary_content": response.content}
+    return {
+        "messages":     [AIMessage(content="✍️ Your diary is ready! Review it below.")],
+        "diary_content": response.content,
+    }
+
+
+def diary_action_node(state: LearnLogState) -> dict:
+    """Node 5a: After quiz — prompt user to write today's diary (button)"""
+    interrupt("__DIARY_ACTION__")
+    return {}
+
+
+def diary_confirm_node(state: LearnLogState) -> dict:
+    """Node 5b: Show diary draft to user — allow editing before posting"""
+    diary    = state.get("diary_content", "")
+    response = interrupt("__DIARY_CONFIRM__")
+
+    # Short confirmations ("post", "ok", etc.) → keep existing diary
+    # Longer text → treat as user-edited diary
+    final_diary = response if len(response.strip()) > 30 else diary
+    return {"diary_content": final_diary}
 
 
 def notion_post_node(state: LearnLogState) -> dict:
@@ -1001,7 +1021,9 @@ def build_graph():
     builder.add_node("resource_search",  resource_search_node)
     builder.add_node("quiz_generate",    quiz_generate_node)
     builder.add_node("quiz",             quiz_node)
+    builder.add_node("diary_action",     diary_action_node)
     builder.add_node("diary_writer",     diary_writer_node)
+    builder.add_node("diary_confirm",    diary_confirm_node)
     builder.add_node("notion_post",      notion_post_node)
 
     # 진입점 분기 엣지
@@ -1039,7 +1061,7 @@ def build_graph():
             "resource_search": "resource_search",
             "quiz_generate":   "quiz_generate",
             "diary_writer":    "diary_writer",
-        }
+        },
     )
     builder.add_conditional_edges(
         "resource_search",
@@ -1047,8 +1069,10 @@ def build_graph():
         {"quiz_generate": "quiz_generate", "diary_writer": "diary_writer"},
     )
     builder.add_edge("quiz_generate", "quiz")
-    builder.add_edge("quiz",          "diary_writer")
-    builder.add_edge("diary_writer",  "notion_post")
+    builder.add_edge("quiz",          "diary_action")
+    builder.add_edge("diary_action",  "diary_writer")
+    builder.add_edge("diary_writer",  "diary_confirm")
+    builder.add_edge("diary_confirm", "notion_post")
     builder.add_edge("notion_post",   END)
 
     conn   = sqlite3.connect("learnlog.db", check_same_thread=False)

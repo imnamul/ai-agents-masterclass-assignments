@@ -160,7 +160,10 @@ if is_running and graph_state.tasks:
         for intr in task.interrupts:
             current_interrupt = intr.value
 
-if current_interrupt:
+# Sentinel strings that should NOT appear as chat bubbles
+_SILENT_INTERRUPTS = {"__ACTION_SELECT__", "__DIARY_ACTION__", "__DIARY_CONFIRM__"}
+
+if current_interrupt and current_interrupt not in _SILENT_INTERRUPTS:
     last = st.session_state.chat_log[-1] if st.session_state.chat_log else None
     if not last or last["content"] != current_interrupt:
         st.session_state.chat_log.append({"role": "assistant", "content": current_interrupt})
@@ -216,6 +219,20 @@ elif is_running:
             if st.button("✍️ Write Journal", use_container_width=True):
                 st.session_state.chat_log.append({"role": "user", "content": "✍️ Write Journal"})
                 _resume("diary")
+
+    elif current_interrupt == "__DIARY_ACTION__":
+        if st.button("✍️ Write Today's Diary", type="primary", use_container_width=True):
+            st.session_state.chat_log.append({"role": "user", "content": "✍️ Write Today's Diary"})
+            _resume("write")
+
+    elif current_interrupt and "__DIARY_CONFIRM__" in current_interrupt:
+        st.markdown("**Review your learning diary — edit if you'd like, then post! 📮**")
+        diary_draft = vals.get("diary_content", "")
+        edited = st.text_area("Today's Learning Diary", value=diary_draft, height=380, key="diary_edit")
+        if st.button("📮 Post to Notion", type="primary", use_container_width=True):
+            st.session_state.chat_log.append({"role": "user", "content": "📮 Posted to Notion"})
+            _resume(edited)
+
     else:
         user_input = st.chat_input("Type your response...")
         if user_input:
@@ -279,7 +296,7 @@ else:
                 "curriculum":         {},
                 "current_week":       0,
                 "current_topic":      "",
-                "tutor_persona":        "",
+                "tutor_persona":      "",
                 "quiz_history":       [],
                 "progress_pct":       0.0,
                 "entry_mode":         "",

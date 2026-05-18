@@ -63,6 +63,26 @@ with st.sidebar:
                 for _res_line in search_results.strip().split("\n"):
                     if _res_line.strip():
                         st.markdown(_res_line)
+
+            # ── Curriculum Weeks ─────────────────────────────────────
+            phases = vals.get("curriculum", {}).get("phases", [])
+            if phases and current_week > 0:
+                st.subheader("📚 Curriculum")
+                for phase in phases:
+                    phase_week  = phase.get("week", 0)
+                    phase_theme = phase.get("theme", "")
+                    phase_days  = phase.get("days", [])
+                    is_current  = (phase_week == current_week)
+                    with st.expander(f"Week {phase_week}: {phase_theme}", expanded=is_current):
+                        for d in phase_days:
+                            day_num     = d.get("day", 0)
+                            day_topic   = d.get("topic", "")
+                            completed   = streak >= (phase_week - 1) * 7 + day_num
+                            day_in_week = streak - (current_week - 1) * 7
+                            is_today    = is_current and day_num == day_in_week
+                            label       = f"{'▶ ' if is_today else ''}Day {day_num}: {day_topic}"
+                            st.checkbox(label, value=completed, disabled=True,
+                                        key=f"w{phase_week}d{day_num}")
     if streak:
         st.metric("🔥 Streak", f"{streak} day streak")
 

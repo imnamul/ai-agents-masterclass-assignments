@@ -5,6 +5,7 @@ Run: uv run streamlit run app.py
 
 import os
 import time
+import uuid
 import streamlit as st
 from datetime import date
 from langchain_core.messages import HumanMessage
@@ -18,7 +19,7 @@ st.title("📚 LearnLog — Learning Habit Tracker")
 
 # ── Session State ───────────────────────────────────────────────
 if "thread_id" not in st.session_state:
-    st.session_state.thread_id = "user-main"
+    st.session_state.thread_id = str(uuid.uuid4())
 if "chat_log" not in st.session_state:
     st.session_state.chat_log = []
 if "synced_msg_count" not in st.session_state:
@@ -76,6 +77,12 @@ with st.sidebar:
             st.write(f"{marker} {g}")
 
     st.divider()
+    if active_goal or is_running:
+        if st.button("🔄 Reset Session", use_container_width=True):
+            st.session_state.thread_id        = str(uuid.uuid4())
+            st.session_state.chat_log         = []
+            st.session_state.synced_msg_count = 0
+            st.rerun()
     st.caption("LearnLog · Powered by LangGraph")
 
     # ── Developer Mode ──────────────────────────────────────────
@@ -181,6 +188,7 @@ elif is_running:
         _progress_labels = {
             "domain_analysis":  "📊 Analyzing domain...",
             "curriculum_build": "📅 Building curriculum...",
+            "resource_verify":  "🔗 Verifying resource links...",
             "persona_build":    "🎓 Setting up AI tutor...",
         }
         with st.spinner("Thinking..."):

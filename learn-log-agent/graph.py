@@ -391,6 +391,64 @@ For each phase, include 2–3 resources in the resources field:
     return {"curriculum": curriculum_obj.model_dump()}
 
 
+def resource_verify_node(state: LearnLogState) -> dict:
+    """Node 2c: Verify resource URLs — Tavily Extract + Search fallback (Option C)"""
+    curriculum = state.get("curriculum", {})
+    phases     = curriculum.get("phases", [])
+    tavily_key = _get_secret("TAVILY_API_KEY")
+
+    if not tavily_key or not phases:
+        return {}
+
+    try:
+        from tavily import TavilyClient
+        client = TavilyClient(api_key=tavily_key)
+    except Exception:
+        return {}
+
+    verified_phases = []
+    for phase in phases:
+        resources          = phase.get("resources", [])
+        verified_resources = []
+
+        for resource in resources:
+            url   = resource.get("url", "")
+            title = resource.get("title", "")
+            if not url:
+                continue
+
+            # Step 1: Tavily Extract — verify URL is accessible
+            try:
+                extract = client.extract(urls=[url])
+                if extract.get("results"):
+                    verified_resources.append(resource)
+                    continue
+            except Exception:
+                pass
+
+            # Step 2: Tavily Search fallback — find replacement URL
+            try:
+                query          = f"{phase.get('theme', '')} {title} official documentation"
+                search_results = tavily_search.invoke(query)
+                if isinstance(search_results, list) and search_results:
+                    top = search_results[0]
+                    if isinstance(top, dict) and top.get("url"):
+                        verified_resources.append({
+                            "title": top.get("title", title),
+                            "url":   top["url"],
+                        })
+            except Exception:
+                pass  # Both failed — drop this resource
+
+        phase_copy             = dict(phase)
+        phase_copy["resources"] = verified_resources
+        verified_phases.append(phase_copy)
+
+    curriculum_copy           = dict(curriculum)
+    curriculum_copy["phases"] = verified_phases
+    return {"curriculum": curriculum_copy}
+
+
 def persona_build_node(state: LearnLogState) -> dict:
     """노드 2c: 습관 + 튜터 페르소나 생성 + 요약 메시지"""
     existing_goals = state.get("learning_goals", [])
@@ -874,6 +932,7 @@ def build_graph():
     builder.add_node("goal_detail",      goal_detail_node)
     builder.add_node("domain_analysis",  domain_analysis_node)
     builder.add_node("curriculum_build", curriculum_build_node)
+    builder.add_node("resource_verify",  resource_verify_node)
     builder.add_node("persona_build",    persona_build_node)
     builder.add_node("checkin",          checkin_node)
     builder.add_node("checkin_response", checkin_response_node)
@@ -884,27 +943,29 @@ def build_graph():
     builder.add_node("diary_writer",     diary_writer_node)
     builder.add_node("notion_post",      notion_post_node)
 
-    # 엣지
+    # 진입점 분기 엣지
     builder.add_conditional_edges(
         START,
         route_entry,
-        {"full": "mood_check", "checkin": "checkin"},
+        {"checkin": "checkin", "full": "mood_check"},
     )
-    builder.add_edge("mood_check", "goal_check")
 
+    # 목표 설정 경로
+    builder.add_edge("mood_check", "goal_check")
     builder.add_conditional_edges(
         "goal_check",
         route_after_goal_check,
         {"setup": "goal_detail", "skip": "checkin"},
     )
-
     builder.add_edge("goal_detail",      "domain_analysis")
     builder.add_edge("domain_analysis",  "curriculum_build")
-    builder.add_edge("curriculum_build", "persona_build")
+    builder.add_edge("curriculum_build", "resource_verify")
+    builder.add_edge("resource_verify",  "persona_build")
     builder.add_edge("persona_build",    "checkin")
+
+    # 체크인 경로
     builder.add_edge("checkin",          "checkin_response")
     builder.add_edge("checkin_response", "checkin_action")
-
     builder.add_conditional_edges(
         "checkin_action",
         route_after_checkin,
@@ -914,13 +975,11 @@ def build_graph():
             "diary_writer":    "diary_writer",
         },
     )
-
     builder.add_conditional_edges(
         "resource_search",
         route_after_resource_search,
         {"quiz_generate": "quiz_generate", "diary_writer": "diary_writer"},
     )
-
     builder.add_edge("quiz_generate", "quiz")
     builder.add_edge("quiz",          "diary_writer")
     builder.add_edge("diary_writer",  "notion_post")
@@ -931,5 +990,4 @@ def build_graph():
     return builder.compile(checkpointer=memory)
 
 
-# langgraph dev 가 이 변수를 import 해서 사용합니다
 learnlog_graph = build_graph()

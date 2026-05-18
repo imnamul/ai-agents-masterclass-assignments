@@ -19,7 +19,11 @@ st.title("📚 LearnLog — Learning Habit Tracker")
 
 # ── Session State ───────────────────────────────────────────────
 if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())
+    tid = st.query_params.get("tid")
+    if not tid:
+        tid = str(uuid.uuid4())
+        st.query_params["tid"] = tid
+    st.session_state.thread_id = tid
 if "chat_log" not in st.session_state:
     st.session_state.chat_log = []
 if "synced_msg_count" not in st.session_state:
@@ -58,11 +62,6 @@ with st.sidebar:
             st.caption(f"{int(progress_pct * 100)}% complete · Week {current_week} / {total_weeks} weeks")
             if current_topic:
                 st.info(f"📖 **Today's Topic**\n\n{current_topic}")
-            if search_results:
-                st.caption("📚 Today's Resources")
-                for _res_line in search_results.strip().split("\n"):
-                    if _res_line.strip():
-                        st.markdown(_res_line)
 
             # ── Curriculum Weeks ─────────────────────────────────────
             phases = vals.get("curriculum", {}).get("phases", [])
@@ -95,7 +94,9 @@ with st.sidebar:
     st.divider()
     if active_goal or is_running:
         if st.button("🔄 Reset Session", use_container_width=True):
-            st.session_state.thread_id        = str(uuid.uuid4())
+            new_tid = str(uuid.uuid4())
+            st.query_params["tid"]            = new_tid
+            st.session_state.thread_id        = new_tid
             st.session_state.chat_log         = []
             st.session_state.synced_msg_count = 0
             st.rerun()
@@ -214,11 +215,11 @@ def _resume(value: str):
 
 # ── Auto-scroll to bottom when diary confirm is active ──────────
 if is_running and current_interrupt and "__DIARY_CONFIRM__" in current_interrupt:
-    st.components.v1.html("""<script>
+    st.html("""<script>
         setTimeout(function() {
             window.parent.document.querySelector('.main').scrollTo(0, 999999);
         }, 300);
-    </script>""", height=0)
+    </script>""")
 
 # ── Render chat ─────────────────────────────────────────────────
 for msg in st.session_state.chat_log:
@@ -262,6 +263,40 @@ elif is_running:
         if st.button("📮 Post to Notion", type="primary", use_container_width=True):
             st.session_state.chat_log.append({"role": "user", "content": "📮 Posted to Notion"})
             _resume(edited)
+
+    elif current_interrupt and (
+        current_interrupt == "What would you like to learn? 🎯" or
+        current_interrupt.startswith("Current goal(s):")
+    ):
+        if "goal_domain" not in st.session_state:
+            st.session_state.goal_domain = ""
+
+        _GOAL_DOMAINS = [
+            ("💻", "Programming",    "Python, JavaScript, React"),
+            ("🌍", "Language",       "English, Spanish, Japanese"),
+            ("🔬", "Science & Math", "Calculus, Physics, Statistics"),
+            ("🎨", "Creative Arts",  "Drawing, Music, Design"),
+            ("📚", "Other",          "History, Business, Cooking"),
+        ]
+
+        cols = st.columns(len(_GOAL_DOMAINS))
+        for col, (icon, name, hint) in zip(cols, _GOAL_DOMAINS):
+            with col:
+                is_sel = st.session_state.goal_domain == name
+                if st.button(f"{icon} {name}", use_container_width=True,
+                             help=hint, key=f"domain_{name}",
+                             type="primary" if is_sel else "secondary"):
+                    st.session_state.goal_domain = "" if is_sel else name
+                    st.rerun()
+
+        selected = st.session_state.goal_domain
+        hint_ex = next((h for _, n, h in _GOAL_DOMAINS if n == selected), "Python, Spanish, Calculus")
+
+        goal_text = st.chat_input(f"e.g. {hint_ex}")
+        if goal_text:
+            st.session_state.chat_log.append({"role": "user", "content": goal_text})
+            st.session_state.goal_domain = ""
+            _resume(goal_text)
 
     else:
         user_input = st.chat_input("Type your response...")

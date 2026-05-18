@@ -22,6 +22,11 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.types import interrupt, Command
 from langgraph.checkpoint.sqlite import SqliteSaver
+try:
+    from langgraph.checkpoint.postgres import PostgresSaver
+    _POSTGRES_AVAILABLE = True
+except ImportError:
+    _POSTGRES_AVAILABLE = False
 
 # ── LangChain ──────────────────────────────────────────────────
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -530,7 +535,7 @@ def checkin_topic_node(state: LearnLogState) -> dict:
                 for r in items
                 if isinstance(r, dict) and r.get("title") and r.get("url")
             ]
-            search_results = "\n".join(lines[:3])
+            search_results = "\n\n".join(lines[:3])
         except Exception:
             pass
 
@@ -571,10 +576,16 @@ def checkin_node(state: LearnLogState) -> dict:
     topic_line = f"📖 Today's topic: **{new_topic}**\n" if new_topic else ""
     topic_name = new_topic if new_topic else active_goal
 
+    search_results = state.get("search_results", "")
+    resources_section = ""
+    if search_results:
+        resources_section = f"\n\n📚 **Today's Resources:**\n\n{search_results}"
+
     question = (
         f"{streak_msg}{week_up_msg}\n\n"
         f"{topic_line}"
         f"Share what you learned about [{topic_name}] today. 😊"
+        f"{resources_section}"   # ← 추가
     )
 
     user_input = interrupt(question)
@@ -1033,8 +1044,22 @@ def build_graph():
     builder.add_edge("diary_confirm", "notion_post")
     builder.add_edge("notion_post",   END)
 
-    conn   = sqlite3.connect("learnlog.db", check_same_thread=False)
-    memory = SqliteSaver(conn)
+    postgres_url = None
+    try:
+        import streamlit as _st
+        postgres_url = _st.secrets.get("POSTGRES_URL")
+    except Exception:
+        pass
+    if not postgres_url:
+        import os
+        postgres_url = os.getenv("POSTGRES_URL")
+
+    if postgres_url and _POSTGRES_AVAILABLE:
+        memory = PostgresSaver.from_conn_string(postgres_url)
+        memory.setup()
+    else:
+        conn   = sqlite3.connect("learnlog.db", check_same_thread=False)
+        memory = SqliteSaver(conn)
     return builder.compile(checkpointer=memory)
 
 

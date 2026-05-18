@@ -223,13 +223,29 @@ def mood_node(state: LearnLogState) -> dict:
     mood_input = interrupt(greeting)
 
     mood_res = llm.invoke([HumanMessage(content=
-        f'User mood: "{mood_input}"\n'
-        f"Summarize their mood in one warm sentence in English. Output only the sentence."
+        f'User mood: "{mood_input}"\n\n'
+        f'Write a warm, empathetic 1-2 sentence response to their mood in English.\n'
+        f'Then on a new line write "MOOD_SUMMARY:" followed by a concise mood phrase.\n\n'
+        f'Example:\n'
+        f'That sounds exhausting! Rest is part of the process too. 💙\n'
+        f'MOOD_SUMMARY: tired but resilient'
     )])
 
+    content = mood_res.content.strip()
+    if "MOOD_SUMMARY:" in content:
+        parts         = content.split("MOOD_SUMMARY:", 1)
+        warm_response = parts[0].strip()
+        mood_summary  = parts[1].strip()
+    else:
+        warm_response = content
+        mood_summary  = content
+
     return {
-        "messages": [HumanMessage(content=mood_input)],
-        "mood":     mood_res.content.strip(),
+        "messages": [
+            HumanMessage(content=mood_input),
+            AIMessage(content=warm_response),
+        ],
+        "mood": mood_summary,
     }
 
 
@@ -1023,7 +1039,7 @@ def build_graph():
             "resource_search": "resource_search",
             "quiz_generate":   "quiz_generate",
             "diary_writer":    "diary_writer",
-        },
+        }
     )
     builder.add_conditional_edges(
         "resource_search",

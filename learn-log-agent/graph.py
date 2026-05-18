@@ -122,6 +122,7 @@ class LearnLogState(TypedDict):
     entry_mode:         str         # "checkin" | "" — 진입 모드
     session_date:       str         # 오늘 세션 완료 날짜 (YYYY-MM-DD)
     domain_info:        dict        # domain_analysis_node → curriculum_build_node 중간값
+    curriculum_feedback: str       # 사용자 커리큘럼 피드백 (재생성 시 반영)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -360,6 +361,7 @@ def curriculum_build_node(state: LearnLogState) -> dict:
     d_domain       = domain_info.get("domain", "programming")
     is_framework   = domain_info.get("is_framework", False)
     official_name  = domain_info.get("official_name", "")
+    feedback       = state.get("curriculum_feedback", "")
 
     framework_hint = (
         f"\n⚠️ Important: {official_name} is a specific framework/library. "
@@ -368,10 +370,16 @@ def curriculum_build_node(state: LearnLogState) -> dict:
         if is_framework else ""
     )
 
+    feedback_hint = (
+        f"\n\n⚠️ The user reviewed the previous curriculum and requested the following changes:\n"
+        f"{feedback}\nPlease revise the curriculum accordingly."
+        if feedback else ""
+    )
+
     curriculum_llm = llm.with_structured_output(Curriculum)
     curriculum_obj = curriculum_llm.invoke([HumanMessage(content=f"""Topic: {d_subject}
 Level: {d_level} / Learning style: {d_style} / Duration: {d_weeks} weeks
-{framework_hint}
+{framework_hint}{feedback_hint}
 
 Create a detailed week-by-week, day-by-day curriculum with real content.
 - total_weeks: {d_weeks}
@@ -447,6 +455,37 @@ def resource_verify_node(state: LearnLogState) -> dict:
     curriculum_copy           = dict(curriculum)
     curriculum_copy["phases"] = verified_phases
     return {"curriculum": curriculum_copy}
+
+
+def curriculum_confirm_node(state: LearnLogState) -> dict:
+    """Node 2d: Show curriculum to user and collect confirmation or feedback"""
+    curriculum = state.get("curriculum", {})
+
+    table  = "Here's your personalized curriculum! 🎓\n\n"
+    table += "| Week | Theme | Daily Topics | Checkpoint | Study Resources |\n"
+    table += "|------|-------|--------------|------------|----------------|\n"
+    for p in curriculum.get("phases", []):
+        days_str = "<br>".join(f"• Day{d['day']}: {d['topic']}" for d in p.get("days", []))
+        res_str  = "<br>".join(f"[{r['title']}]({r['url']})" for r in p.get("resources", [])) or "-"
+        table  += f"| Week {p['week']} | {p['theme']} | {days_str} | {p.get('checkpoint', '')} | {res_str} |\n"
+
+    table += (
+        "\n\nDoes this look good? Feel free to let me know if you'd like any changes "
+        "— or just say **yes** to get started! 🚀"
+    )
+
+    response = interrupt(table)
+    lower    = response.strip().lower()
+
+    confirmed = any(w in lower for w in [
+        "yes", "ok", "good", "great", "perfect", "looks good",
+        "fine", "proceed", "go", "start", "sure", "sounds good",
+    ])
+
+    if confirmed:
+        return {"next_action": "confirm", "curriculum_feedback": ""}
+    else:
+        return {"next_action": "revise", "curriculum_feedback": response}
 
 
 def persona_build_node(state: LearnLogState) -> dict:
@@ -915,6 +954,11 @@ def route_after_checkin(state: LearnLogState) -> str:
     return "diary_writer"
 
 
+def route_after_curriculum_confirm(state: LearnLogState) -> str:
+    """CE_curriculum: 'confirm' → persona_build / else → curriculum_build (재생성)"""
+    return "persona_build" if state.get("next_action") == "confirm" else "curriculum_build"
+
+
 def route_after_resource_search(state: LearnLogState) -> str:
     """CE3: 검색 후 퀴즈 제안 결과에 따라 분기"""
     return "quiz_generate" if state.get("next_action") == "quiz" else "diary_writer"
@@ -932,8 +976,9 @@ def build_graph():
     builder.add_node("goal_detail",      goal_detail_node)
     builder.add_node("domain_analysis",  domain_analysis_node)
     builder.add_node("curriculum_build", curriculum_build_node)
-    builder.add_node("resource_verify",  resource_verify_node)
-    builder.add_node("persona_build",    persona_build_node)
+    builder.add_node("resource_verify",    resource_verify_node)
+    builder.add_node("curriculum_confirm", curriculum_confirm_node)
+    builder.add_node("persona_build",      persona_build_node)
     builder.add_node("checkin",          checkin_node)
     builder.add_node("checkin_response", checkin_response_node)
     builder.add_node("checkin_action",   checkin_action_node)
@@ -957,11 +1002,16 @@ def build_graph():
         route_after_goal_check,
         {"setup": "goal_detail", "skip": "checkin"},
     )
-    builder.add_edge("goal_detail",      "domain_analysis")
-    builder.add_edge("domain_analysis",  "curriculum_build")
-    builder.add_edge("curriculum_build", "resource_verify")
-    builder.add_edge("resource_verify",  "persona_build")
-    builder.add_edge("persona_build",    "checkin")
+    builder.add_edge("goal_detail",     "domain_analysis")
+    builder.add_edge("domain_analysis", "curriculum_build")
+    builder.add_edge("curriculum_build",  "resource_verify")
+    builder.add_edge("resource_verify",   "curriculum_confirm")
+    builder.add_conditional_edges(
+        "curriculum_confirm",
+        route_after_curriculum_confirm,
+        {"persona_build": "persona_build", "curriculum_build": "curriculum_build"},
+    )
+    builder.add_edge("persona_build", "checkin")
 
     # 체크인 경로
     builder.add_edge("checkin",          "checkin_response")

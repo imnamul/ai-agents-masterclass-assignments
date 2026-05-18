@@ -186,10 +186,11 @@ elif is_running:
     def _resume(value: str):
         """Resume graph — show per-node progress during curriculum generation"""
         _progress_labels = {
-            "domain_analysis":  "📊 Analyzing domain...",
-            "curriculum_build": "📅 Building curriculum...",
-            "resource_verify":  "🔗 Verifying resource links...",
-            "persona_build":    "🎓 Setting up AI tutor...",
+            "domain_analysis":    "📊 Analyzing domain...",
+            "curriculum_build":   "📅 Building curriculum...",
+            "resource_verify":    "🔗 Verifying resource links...",
+            "curriculum_confirm": "📋 Preparing curriculum preview...",
+            "persona_build":      "🎓 Setting up AI tutor...",
         }
         with st.spinner("Thinking..."):
             _placeholder = st.empty()
@@ -206,7 +207,7 @@ elif is_running:
 
     if current_interrupt == "__ACTION_SELECT__":
         st.markdown("**What would you like to do next?**")
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
             if st.button("📝 Take a Quiz", use_container_width=True):
                 st.session_state.chat_log.append({"role": "user", "content": "📝 Take a Quiz"})
@@ -215,10 +216,6 @@ elif is_running:
             if st.button("✍️ Write Journal", use_container_width=True):
                 st.session_state.chat_log.append({"role": "user", "content": "✍️ Write Journal"})
                 _resume("diary")
-        with col3:
-            if st.button("🔍 Search Resources", use_container_width=True):
-                st.session_state.chat_log.append({"role": "user", "content": "🔍 Search Resources"})
-                _resume("search")
     else:
         user_input = st.chat_input("Type your response...")
         if user_input:
@@ -282,7 +279,7 @@ else:
                 "curriculum":         {},
                 "current_week":       0,
                 "current_topic":      "",
-                "tutor_persona":      "",
+                "tutor_persona":        "",
                 "quiz_history":       [],
                 "progress_pct":       0.0,
                 "entry_mode":         "",

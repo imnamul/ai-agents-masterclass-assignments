@@ -48,8 +48,8 @@ with st.sidebar:
     streak         = vals.get("streak", 0)
     current_week   = vals.get("current_week", 0)
     current_topic  = vals.get("current_topic", "")
-    progress_pct   = vals.get("progress_pct", 0.0)
     total_weeks    = vals.get("curriculum", {}).get("total_weeks", 0)
+    progress_pct   = round(min(streak / (total_weeks * 7), 1.0), 2) if total_weeks else 0.0
     search_results = vals.get("search_results", "")
 
     if active_goal:
@@ -137,8 +137,12 @@ with st.sidebar:
                         "today_achievements": "",
                         "diary_content":      "",
                         "messages":           [],
-                        "progress_pct":       0.0,
                         "session_date":       "",
+                        "tutor_qa_index":     0,
+                        "tutor_qa_history":   [],
+                        "tutor_qa_question":  "",
+                        "tutor_qa_answer":    "",
+                        "ready_for_quiz":     False,
                     })
                     st.session_state.chat_log         = []
                     st.session_state.synced_msg_count = 0
@@ -149,16 +153,26 @@ with st.sidebar:
             st.caption(f"Current session_date: `{session_date or 'None'}`")
             if st.button("📅 Simulate Next Day", use_container_width=True):
                 learnlog_graph.update_state(config, {
-                    "session_date":      "2000-01-01",
-                    "mood":              "",
+                    "session_date":       "2000-01-01",
                     "today_achievements": "",
-                    "diary_content":     "",
-                    "next_action":       "",
-                    "search_results":    "",
-                    "quiz_questions":    "",
-                    "messages":          [],
+                    "diary_content":      "",
+                    "next_action":        "",
+                    "search_results":     "",
+                    "quiz_questions":     "",
+                    "messages":           [],
+                    "tutor_qa_index":     0,
+                    "tutor_qa_history":   [],
+                    "tutor_qa_question":  "",
+                    "tutor_qa_answer":    "",
+                    "ready_for_quiz":     False,
                 })
-                st.session_state.chat_log         = [{"role": "divider", "content": "📅 New Day Started"}]
+                from datetime import date as _date
+                _next_day = streak + 1
+                _today_str = _date.today().strftime("%b %d, %Y")
+                st.session_state.chat_log.append({
+                    "role": "divider",
+                    "content": f"📅 Day {_next_day} — {_today_str}",
+                })
                 st.session_state.synced_msg_count = 0
                 st.success("Next day simulation applied!")
                 st.rerun()
@@ -184,7 +198,7 @@ if current_interrupt is None and is_running:
         current_interrupt = "__DIARY_CONFIRM__"
 
 # Sentinel strings that should NOT appear as chat bubbles
-_SILENT_INTERRUPTS = {"__ACTION_SELECT__", "__DIARY_ACTION__", "__DIARY_CONFIRM__"}
+_SILENT_INTERRUPTS = {"__ACTION_SELECT__", "__DIARY_ACTION__", "__DIARY_CONFIRM__", "__TUTOR_QA__"}
 
 if current_interrupt and current_interrupt not in _SILENT_INTERRUPTS:
     last = st.session_state.chat_log[-1] if st.session_state.chat_log else None
@@ -195,10 +209,14 @@ if current_interrupt and current_interrupt not in _SILENT_INTERRUPTS:
 def _resume(value: str):
     """Resume graph — show per-node progress during curriculum generation"""
     _progress_labels = {
-        "domain_analysis":    "📊 Analyzing domain...",
-        "curriculum_build":   "📅 Building curriculum...",
+        "curriculum_build":   "📅 Analyzing domain & building curriculum...",
         "curriculum_confirm": "📋 Preparing curriculum preview...",
         "persona_build":      "🎓 Setting up AI tutor...",
+        "tutor_qa_generate":  "🎓 Preparing question...",
+        "tutor_qa_feedback":  "📝 Evaluating your answer...",
+        "quiz_generate":      "📝 Generating quiz...",
+        "diary_writer":       "✍️ Writing your diary...",
+        "notion_post":        "📮 Posting to Notion...",
     }
     with st.spinner("Thinking..."):
         _placeholder = st.empty()
@@ -224,10 +242,14 @@ if is_running and current_interrupt and "__DIARY_CONFIRM__" in current_interrupt
 # ── Render chat ─────────────────────────────────────────────────
 for msg in st.session_state.chat_log:
     if msg["role"] == "divider":
-        st.divider()
-        st.caption(msg["content"])
+        st.html(f"""<div style="display:flex;align-items:center;gap:10px;margin:20px 0 8px;">
+            <hr style="flex:1;border:none;border-top:1px solid #d0d0d0;margin:0;">
+            <span style="color:#999;font-size:0.8em;white-space:nowrap;font-weight:500;">{msg['content']}</span>
+            <hr style="flex:1;border:none;border-top:1px solid #d0d0d0;margin:0;">
+        </div>""")
     else:
-        with st.chat_message(msg["role"]):
+        avatar = "🎓" if msg["role"] == "assistant" else None
+        with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"], unsafe_allow_html=True)
 
 # ── Input / Button handling ─────────────────────────────────────
@@ -239,24 +261,7 @@ if is_done:
         st.rerun()
 
 elif is_running:
-    if current_interrupt == "__ACTION_SELECT__":
-        st.markdown("**What would you like to do next?**")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📝 Take a Quiz", use_container_width=True):
-                st.session_state.chat_log.append({"role": "user", "content": "📝 Take a Quiz"})
-                _resume("quiz")
-        with col2:
-            if st.button("✍️ Write Journal", use_container_width=True):
-                st.session_state.chat_log.append({"role": "user", "content": "✍️ Write Journal"})
-                _resume("diary")
-
-    elif current_interrupt == "__DIARY_ACTION__":
-        if st.button("✍️ Write Today's Diary", type="primary", use_container_width=True):
-            st.session_state.chat_log.append({"role": "user", "content": "✍️ Write Today's Diary"})
-            _resume("write")
-
-    elif current_interrupt and "__DIARY_CONFIRM__" in current_interrupt:
+    if current_interrupt and "__DIARY_CONFIRM__" in current_interrupt:
         st.markdown("**Review your learning diary — edit if you'd like, then post! 📮**")
         diary_draft = vals.get("diary_content", "")
         edited = st.text_area("Today's Learning Diary", value=diary_draft, height=380, key="diary_edit")
@@ -309,6 +314,14 @@ else:
 
     if active_goal:
         if st.button("📝 Today's Check-in", type="primary", use_container_width=True):
+            if streak > 0:
+                from datetime import date as _date
+                _next_day = streak + 1
+                _today_str = _date.today().strftime("%b %d, %Y")
+                st.session_state.chat_log.append({
+                    "role": "divider",
+                    "content": f"📅 Day {_next_day} — {_today_str}",
+                })
             with st.spinner("Starting..."):
                 for _ in learnlog_graph.stream(
                     {"messages": [], "entry_mode": "checkin"},

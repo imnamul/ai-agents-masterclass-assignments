@@ -59,8 +59,15 @@ if _openai_key:
 if _tavily_key:
     os.environ.setdefault("TAVILY_API_KEY", _tavily_key)
 
-llm           = init_chat_model("openai:gpt-4o-mini")
-tavily_search = TavilySearch(max_results=3)
+try:
+    llm = init_chat_model("openai:gpt-4o-mini")
+except Exception:
+    llm = None  # type: ignore  # 테스트 환경에서 mock으로 대체
+
+try:
+    tavily_search = TavilySearch(max_results=3)
+except Exception:
+    tavily_search = None  # type: ignore
 
 
 # ══════════════════════════════════════════════════════════════
@@ -104,7 +111,6 @@ class LearnLogState(TypedDict):
     messages:           Annotated[list, add_messages]
     learning_goals:     List[str]   # 전체 목표 목록 (복수 지원)
     active_goal:        str         # 오늘 활성 목표
-    mood:               str         # 오늘 기분
     today_achievements: str         # 오늘 학습 성취
     streak:             int         # 연속 달성 일수
     search_results:     str
@@ -117,12 +123,16 @@ class LearnLogState(TypedDict):
     tutor_persona:      str         # 동적 생성 튜터 System Prompt
     quiz_history:       List[dict]  # 퀴즈 기록 (스페이스드 리피티션용)
     quiz_questions:     str         # 생성된 퀴즈 문제 (interrupt 재실행 방지용)
-    progress_pct:       float       # 전체 진도율 (0.0 ~ 1.0)
     user_level:         str         # 사용자 학습 수준 (beginner/intermediate/advanced)
     entry_mode:         str         # "checkin" | "" — 진입 모드
     session_date:       str         # 오늘 세션 완료 날짜 (YYYY-MM-DD)
-    domain_info:        dict        # domain_analysis_node → curriculum_build_node 중간값
-    curriculum_feedback: str       # 사용자 커리큘럼 피드백 (재생성 시 반영)
+    curriculum_feedback: str        # 사용자 커리큘럼 피드백 (재생성 시 반영)
+    # ── 튜터 Q&A 세션 ────────────────────────────────────────────
+    tutor_qa_index:     int         # 현재 질문 번호 (0-based)
+    ready_for_quiz:     bool        # 튜터 퀴즈 진입 신호 (LLM 판단)
+    tutor_qa_question:  str         # 현재 질문 (interrupt 재실행 방지)
+    tutor_qa_answer:    str         # 현재 답변
+    tutor_qa_history:   List[dict]  # [{question, answer, feedback}, ...]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -343,11 +353,13 @@ Respond with JSON only.""")])
     }
 
 
-def domain_analysis_node(state: LearnLogState) -> dict:
-    """노드 2a: 도메인 분석 (DomainAnalysis Structured Output)"""
+def curriculum_build_node(state: LearnLogState) -> dict:
+    """노드 2a+b: 도메인 분석 + 커리큘럼 생성 (LLM only, no interrupt)"""
     new_goal   = state.get("active_goal", "")
     user_level = state.get("user_level", "beginner")
+    feedback   = state.get("curriculum_feedback", "")
 
+    # ── 도메인 분석 ──────────────────────────────────────────────
     domain_llm = llm.with_structured_output(DomainAnalysis)
     domain = domain_llm.invoke([HumanMessage(content=f"""Learning goal: "{new_goal}"
 User level: "{user_level}"
@@ -364,20 +376,13 @@ Analyze the learning goal above.
 
 Important: "LangGraph" is a Python-based AI agent workflow framework, NOT a graph data structure library.""")])
 
-    return {"domain_info": domain.model_dump()}
-
-
-def curriculum_build_node(state: LearnLogState) -> dict:
-    """노드 2b: 커리큘럼 생성 (Curriculum Structured Output)"""
-    domain_info    = state.get("domain_info", {})
-    d_subject      = domain_info.get("subject", state.get("active_goal", ""))
-    d_level        = domain_info.get("level", "beginner")
-    d_style        = domain_info.get("learning_style", "mixed")
-    d_weeks        = domain_info.get("estimated_weeks", 4)
-    d_domain       = domain_info.get("domain", "programming")
-    is_framework   = domain_info.get("is_framework", False)
-    official_name  = domain_info.get("official_name", "")
-    feedback       = state.get("curriculum_feedback", "")
+    d_subject     = domain.subject
+    d_level       = domain.level
+    d_style       = domain.learning_style
+    d_weeks       = domain.estimated_weeks
+    d_domain      = domain.domain
+    is_framework  = domain.is_framework
+    official_name = domain.official_name
 
     framework_hint = (
         f"\n⚠️ Important: {official_name} is a specific framework/library. "
@@ -385,13 +390,13 @@ def curriculum_build_node(state: LearnLogState) -> dict:
         f"Structure content around hands-on practice with official documentation."
         if is_framework else ""
     )
-
     feedback_hint = (
         f"\n\n⚠️ The user reviewed the previous curriculum and requested the following changes:\n"
         f"{feedback}\nPlease revise the curriculum accordingly."
         if feedback else ""
     )
 
+    # ── 커리큘럼 생성 ────────────────────────────────────────────
     curriculum_llm = llm.with_structured_output(Curriculum)
     curriculum_obj = curriculum_llm.invoke([HumanMessage(content=f"""Topic: {d_subject}
 Level: {d_level} / Learning style: {d_style} / Duration: {d_weeks} weeks
@@ -515,6 +520,7 @@ def checkin_topic_node(state: LearnLogState) -> dict:
         day_entry   = next((d for d in days if d["day"] == day_in_week), None)
         new_topic   = day_entry["topic"] if day_entry else phase["theme"]
     else:
+        new_week  = state.get("current_week", 1)
         new_topic = state.get("current_topic", "")
 
     active_goal    = get_active_goal(state)
@@ -539,42 +545,37 @@ def checkin_topic_node(state: LearnLogState) -> dict:
         except Exception:
             pass
 
-    return {"search_results": search_results}
+    return {
+        "search_results":    search_results,
+        "tutor_qa_index":    0,
+        "ready_for_quiz":    False,
+        "tutor_qa_history":  [],
+        "tutor_qa_question": "",
+        "tutor_qa_answer":   "",
+        "streak":            new_streak,   # 사이드바 즉시 반영
+        "current_week":      new_week,
+        "current_topic":     new_topic,
+    }
 
 
 def checkin_node(state: LearnLogState) -> dict:
-    """노드 3a: 오늘 학습 내용 입력 (interrupt)"""
-    streak      = state.get("streak", 0)
-    active_goal = get_active_goal(state)
-    curriculum  = state.get("curriculum", {})
-    prev_week   = state.get("current_week", 1)
-    new_streak  = streak + 1
+    """노드 3b: 오늘 학습 시작 체크인 (interrupt) — 진도는 checkin_topic_node에서 미리 계산"""
+    streak       = state.get("streak", 0)        # checkin_topic_node에서 이미 증가된 값
+    active_goal  = get_active_goal(state)
+    curriculum   = state.get("curriculum", {})
+    new_week     = state.get("current_week", 1)  # checkin_topic_node에서 저장
+    new_topic    = state.get("current_topic", "") # checkin_topic_node에서 저장
 
-    # ── 진도 계산 ──────────────────────────────────────────────
-    if curriculum.get("phases"):
-        total_weeks  = curriculum.get("total_weeks", 1)
-        new_week     = min((new_streak - 1) // 7 + 1, total_weeks)
-        phases       = curriculum["phases"]
-        phase        = next((p for p in phases if p["week"] == new_week), phases[-1])
-        day_in_week  = ((new_streak - 1) % 7) + 1
-        days         = phase.get("days", [])
-        day_entry    = next((d for d in days if d["day"] == day_in_week), None)
-        new_topic    = day_entry["topic"] if day_entry else phase["theme"]
-        new_progress = round(min(new_streak / (total_weeks * 7), 1.0), 2)
-    else:
-        new_week     = prev_week
-        new_topic    = state.get("current_topic", "")
-        new_progress = state.get("progress_pct", 0.0)
-
-    # ── New week notification ──────────────────────────────────
+    # ── New week notification (streak 기준: 7의 배수+1이면 새 주 시작) ──
+    total_weeks = curriculum.get("total_weeks", 1)
+    prev_week   = min((streak - 2) // 7 + 1, total_weeks) if streak > 1 else 0
     week_up_msg = (
         f"\n\n🎉 Week {new_week} starts today! You'll be learning [{new_topic}]!"
         if new_week > prev_week else ""
     )
 
-    streak_msg = f"🔥 {streak} day streak!" if streak > 0 else "🌱 Let's start your first day!"
+    streak_msg = f"🔥 {streak - 1} day streak!" if streak > 1 else "🌱 Let's start your first day!"
     topic_line = f"📖 Today's topic: **{new_topic}**\n" if new_topic else ""
-    topic_name = new_topic if new_topic else active_goal
 
     search_results = state.get("search_results", "")
     resources_section = ""
@@ -584,8 +585,8 @@ def checkin_node(state: LearnLogState) -> dict:
     question = (
         f"{streak_msg}{week_up_msg}\n\n"
         f"{topic_line}"
-        f"Share what you learned about [{topic_name}] today. 😊"
-        f"{resources_section}"   # ← 추가
+        f"{resources_section}\n\n"
+        f"Ready to dive into today's lesson? 🚀"
     )
 
     user_input = interrupt(question)
@@ -593,99 +594,128 @@ def checkin_node(state: LearnLogState) -> dict:
     return {
         "messages":           [HumanMessage(content=user_input)],
         "today_achievements":  user_input,
-        "streak":              new_streak,
-        "current_week":        new_week,
-        "current_topic":       new_topic,
-        "progress_pct":        new_progress,
+        # streak / current_week / current_topic: checkin_topic_node에서 이미 저장
     }
 
 
-def checkin_response_node(state: LearnLogState) -> dict:
-    """노드 3b: 튜터 응답 생성 (LLM only, no interrupt)"""
-    tutor_persona    = state.get("tutor_persona", "You are a friendly learning tutor.")
-    today_achievements = state.get("today_achievements", "")
-    current_topic    = state.get("current_topic", "")
-    active_goal      = get_active_goal(state)
-
-    response = llm.invoke([
-        SystemMessage(content=tutor_persona),
-        HumanMessage(content=(
-            f"Topic: {current_topic or active_goal}\n"
-            f"What the learner studied today: {today_achievements}\n\n"
-            f"Encourage the learner and highlight the key concepts from today's session. (3–5 sentences, in English)"
-        )),
-    ])
-
-    return {"messages": [AIMessage(content=response.content)]}
 
 
-def checkin_action_node(state: LearnLogState) -> dict:
-    """노드 3c: 다음 액션 선택 (interrupt — app.py에서 버튼으로 렌더링)"""
-    action = interrupt("__ACTION_SELECT__")
-    # action: "search" | "quiz" | "diary"
-    next_action = {
-        "search": "search",
-        "quiz":   "quiz",
-        "diary":  "write",
-    }.get(action, "write")
-    return {"next_action": next_action}
+
+def tutor_qa_generate_node(state: LearnLogState) -> dict:
+    """Node 3b: Turn1=수준파악+수업시작, Turn2+=답변응답+진도추적+ready판단 (LLM, no interrupt)"""
+    MIN_TURNS = 2
+    MAX_TURNS = 5
+
+    tutor_persona = state.get("tutor_persona", "You are a friendly learning tutor.")
+    topic         = state.get("current_topic", "") or get_active_goal(state)
+    active_goal   = get_active_goal(state)
+    current_week  = state.get("current_week", 1)
+    streak        = state.get("streak", 0)
+    index         = state.get("tutor_qa_index", 0)
+    history       = state.get("tutor_qa_history", [])
+
+    # 커리큘럼 컨텍스트 추출
+    curriculum  = state.get("curriculum", {})
+    total_weeks = curriculum.get("total_weeks", 4)
+    phases      = curriculum.get("phases", [])
+    phase       = next((p for p in phases if p["week"] == current_week), {})
+    week_theme  = phase.get("theme", "")
+    checkpoint  = phase.get("checkpoint", "")
+    all_days    = phase.get("days", [])
+
+    # 오늘이 이번 주 몇 번째 날인지 (1~7)
+    day_in_week     = ((streak - 1) % 7) + 1 if streak > 0 else 1
+    remaining_days  = [d["topic"] for d in all_days if d.get("day", 0) > day_in_week]
+
+    if index == 0:
+        # ── Turn 1: 수준 파악 → 오늘 범위 소개 → 첫 개념 진입 ──────
+        remaining_str = (f"- Remaining days this week: {', '.join(remaining_days)}"
+                         if remaining_days else "- Last day of this week")
+        prompt = (
+            f"You are teaching {topic} to a student working toward: {active_goal}.\n\n"
+            f"[Lesson Context]\n"
+            f"- Week {current_week} of {total_weeks}: {week_theme}\n"
+            f"- Today (Day {day_in_week}/7): {topic}\n"
+            f"- Week mastery goal: {checkpoint}\n"
+            f"{remaining_str}\n\n"
+            f"[Your task — conversational, NOT lecture-style]\n"
+            f"1. Start with ONE short diagnostic question to gauge what the student "
+            f"already knows about '{topic}'\n"
+            f"2. Give a concise 2-3 sentence intro: what it is and why it matters today\n"
+            f"3. Introduce the first core concept with a real, concrete example\n"
+            f"4. End with ONE open question to check understanding\n\n"
+            f"Keep it warm and conversational. In English."
+        )
+        res = llm.invoke([SystemMessage(content=tutor_persona),
+                          HumanMessage(content=prompt)])
+        return {
+            "messages":          [AIMessage(content=res.content)],
+            "tutor_qa_question": res.content,
+            "ready_for_quiz":    False,
+        }
+    else:
+        # ── Turn 2+: 답변 응답 + 진도 추적 + ready_for_quiz 판단 ──────
+        history_text = "\n".join([
+            f"Tutor: {h['question']}\nStudent: {h['answer']}"
+            for h in history
+        ])
+        prompt = (
+            f"You are teaching {topic} (Week {current_week}: {week_theme}) "
+            f"to a student.\n\n"
+            f"[Today's target]\n"
+            f"- Core topic: {topic}\n"
+            f"- Mastery goal: {checkpoint}\n"
+            f"- Exchange {index} of max {MAX_TURNS}\n\n"
+            f"[Conversation so far]\n"
+            f"{history_text}\n\n"
+            f"[Your task]\n"
+            f"1. Respond to the student's last answer:\n"
+            f"   - Correct → affirm briefly, then go deeper or move to next concept\n"
+            f"   - Partial → acknowledge what's right, then fill the gap\n"
+            f"   - Wrong → reteach with a different angle or simpler example\n"
+            f"2. Keep advancing — don't re-explain what's already understood\n"
+            f"3. End with ONE focused question or hands-on prompt\n\n"
+            f"Set ready_for_quiz: true ONLY when:\n"
+            f"- The core concept of '{topic}' has been sufficiently covered\n"
+            f"- Student has demonstrated basic understanding\n"
+            f"- At least {MIN_TURNS} exchanges done (current: {index})\n\n"
+            f"Respond in JSON only:\n"
+            f'{{"message": "...", "ready_for_quiz": false}}'
+        )
+        res    = llm.invoke([SystemMessage(content=tutor_persona),
+                             HumanMessage(content=prompt)])
+        parsed = parse_json(res.content) or {}
+        msg    = parsed.get("message") or res.content
+        ready  = bool(parsed.get("ready_for_quiz", False))
+        if index >= MAX_TURNS:
+            ready = True
+        return {
+            "messages":          [AIMessage(content=msg)],
+            "tutor_qa_question": msg,
+            "ready_for_quiz":    ready,
+        }
 
 
-def resource_search_node(state: LearnLogState) -> dict:
-    """노드 4: Tavily로 학습 자료 검색 + 퀴즈 여부 확인 (interrupt)"""
-    goal         = get_active_goal(state)
-    achievements = state.get("today_achievements", "")
-    query        = f"{goal} {achievements} learning resources tutorial".strip()
-
-    try:
-        results = tavily_search.invoke(query)
-        # TavilySearch returns Dict{"query":..., "results":[...]}
-        if isinstance(results, dict) and "results" in results:
-            raw_list = results["results"]
-        elif isinstance(results, list):
-            raw_list = results
-        elif isinstance(results, str):
-            raw_list = []
-            formatted = results
-        else:
-            raw_list = []
-        if isinstance(results, (dict, list)):
-            lines = []
-            for r in raw_list:
-                if isinstance(r, dict):
-                    title   = r.get("title", "")
-                    url     = r.get("url", "")
-                    content = r.get("content", "")[:120]
-                    lines.append(f"📌 {title}\n   🔗 {url}\n   {content}...")
-                else:
-                    lines.append(str(r))
-            formatted = "\n".join(lines)
-        else:
-            formatted = str(results)
-    except Exception as e:
-        error_msg = f"Search failed: {e}\nPlease try searching directly. 🙏"
-        return {"messages": [AIMessage(content=error_msg)], "search_results": "", "next_action": "write"}
-
-    response = llm.invoke([SystemMessage(
-        content=f"Learning goal: {goal}\nToday's study: {achievements}\n\nSearch results:\n{formatted}\n\nIntroduce these resources in a helpful and friendly way in English."
-    )])
-
-    # ── Quiz offer interrupt ────────────────────────────────────
-    current_topic = state.get("current_topic", "") or goal
-
-    quiz_offer = interrupt(
-        f"{response.content}\n\n"
-        f"---\n"
-        f"📝 Would you like to take a quiz on today's topic [{current_topic}]? (yes / no)"
-    )
-
-    wants_quiz = any(kw in quiz_offer.lower() for kw in
-                     ["yes", "y", "sure", "ok", "yep", "quiz", "let's"])
-
+def tutor_qa_answer_node(state: LearnLogState) -> dict:
+    """Node 3c: 사용자 답변 대기 (interrupt)"""
+    user_answer = interrupt("__TUTOR_QA__")
     return {
-        "messages":       [],
-        "search_results": formatted,
-        "next_action":    "quiz" if wants_quiz else "write",
+        "messages":        [HumanMessage(content=user_answer)],
+        "tutor_qa_answer": user_answer,
+    }
+
+
+def tutor_qa_feedback_node(state: LearnLogState) -> dict:
+    """Node 3d: 답변을 history에 저장 + index 증가 (LLM 없음 — generate_node가 응답 담당)"""
+    index    = state.get("tutor_qa_index", 0)
+    question = state.get("tutor_qa_question", "")
+    answer   = state.get("tutor_qa_answer", "")
+    history  = state.get("tutor_qa_history", [])
+
+    new_record = {"question": question, "answer": answer}
+    return {
+        "tutor_qa_history": history + [new_record],
+        "tutor_qa_index":   index + 1,
     }
 
 
@@ -837,15 +867,18 @@ At the end, give the total score (X/3) and suggest a topic to review next.""")
 def diary_writer_node(state: LearnLogState) -> dict:
     """노드 5: 기분 + 성취를 묶어 일기 작성"""
     today        = date.today().strftime("%B %d, %Y")
-    mood         = state.get("mood", "") or "a calm day"
     goal         = get_active_goal(state)
-    achievements = state.get("today_achievements", "") or "No learning recorded for today"
+    tutor_history = state.get("tutor_qa_history", [])
+    if tutor_history:
+        covered      = "\n".join([f"- {h['answer'][:120]}" for h in tutor_history])
+        achievements = f"Topics covered in tutoring session:\n{covered}"
+    else:
+        achievements = state.get("today_achievements", "") or "No learning recorded for today"
     streak       = state.get("streak", 0)
 
     prompt = f"""Write today's learning journal entry in English.
 
 Date: {today}
-Mood: {mood}
 Learning goal: {goal}
 Today's achievements: {achievements}
 Streak: {streak} days
@@ -853,7 +886,6 @@ Streak: {streak} days
 Format:
 ---
 📅 {today}
-😊 Mood: [one expressive sentence about today's mood]
 🎯 Goal: [brief goal summary]
 
 ✅ Today's Learning:
@@ -877,12 +909,6 @@ Close with a warm, encouraging message in English."""
     }
 
 
-def diary_action_node(state: LearnLogState) -> dict:
-    """Node 5a: After quiz — prompt user to write today's diary (button)"""
-    interrupt("__DIARY_ACTION__")
-    return {}
-
-
 def diary_confirm_node(state: LearnLogState) -> dict:
     """Node 5b: Show diary draft to user — allow editing before posting"""
     diary    = state.get("diary_content", "")
@@ -898,7 +924,6 @@ def notion_post_node(state: LearnLogState) -> dict:
     """노드 6: 일기를 Notion에 포스팅"""
     diary  = state.get("diary_content", "")
     goal   = get_active_goal(state)
-    mood   = state.get("mood", "") or "a calm day"
     streak = state.get("streak", 0)
 
     if not diary:
@@ -910,7 +935,7 @@ def notion_post_node(state: LearnLogState) -> dict:
     result = post_to_notion.invoke({
         "diary_content": diary,
         "learning_goal": goal,
-        "mood":          mood,
+        "mood":          "a calm day",
         "streak":        streak,
     })
 
@@ -949,24 +974,21 @@ def route_after_goal_check(state: LearnLogState) -> str:
     return state.get("next_action", "skip")
 
 
-def route_after_checkin(state: LearnLogState) -> str:
-    """CE2: 'search' → resource_search / 'quiz' → quiz_generate / 'write' → diary_writer"""
-    action = state.get("next_action", "write")
-    if action == "search":
-        return "resource_search"
-    if action == "quiz":
-        return "quiz_generate"
-    return "diary_writer"
-
-
 def route_after_curriculum_confirm(state: LearnLogState) -> str:
     """CE_curriculum: 'confirm' → persona_build / else → curriculum_build (재생성)"""
     return "persona_build" if state.get("next_action") == "confirm" else "curriculum_build"
 
 
-def route_after_resource_search(state: LearnLogState) -> str:
-    """CE3: 검색 후 퀴즈 제안 결과에 따라 분기"""
-    return "quiz_generate" if state.get("next_action") == "quiz" else "diary_writer"
+def route_tutor_qa(state: LearnLogState) -> str:
+    """CE_tutor_qa: ready_for_quiz(LLM 판단) + min/max 턴 안전장치"""
+    MIN_TURNS, MAX_TURNS = 2, 5
+    index          = state.get("tutor_qa_index", 0)
+    ready_for_quiz = state.get("ready_for_quiz", False)
+    if index >= MAX_TURNS:
+        return "quiz_generate"
+    if index >= MIN_TURNS and ready_for_quiz:
+        return "quiz_generate"
+    return "tutor_qa_generate"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -976,70 +998,56 @@ def build_graph():
     builder = StateGraph(LearnLogState)
 
     # 노드 등록
-    builder.add_node("mood_check",       mood_node)
-    builder.add_node("goal_check",       goal_check_node)
-    builder.add_node("goal_detail",      goal_detail_node)
-    builder.add_node("domain_analysis",  domain_analysis_node)
-    builder.add_node("curriculum_build", curriculum_build_node)
+    builder.add_node("goal_check",         goal_check_node)
+    builder.add_node("goal_detail",        goal_detail_node)
+    builder.add_node("curriculum_build",   curriculum_build_node)
     builder.add_node("curriculum_confirm", curriculum_confirm_node)
     builder.add_node("persona_build",      persona_build_node)
-    builder.add_node("checkin_topic",     checkin_topic_node)
-    builder.add_node("checkin",          checkin_node)
-    builder.add_node("checkin_response", checkin_response_node)
-    builder.add_node("checkin_action",   checkin_action_node)
-    builder.add_node("resource_search",  resource_search_node)
-    builder.add_node("quiz_generate",    quiz_generate_node)
-    builder.add_node("quiz",             quiz_node)
-    builder.add_node("diary_action",     diary_action_node)
-    builder.add_node("diary_writer",     diary_writer_node)
-    builder.add_node("diary_confirm",    diary_confirm_node)
-    builder.add_node("notion_post",      notion_post_node)
+    builder.add_node("checkin_topic",      checkin_topic_node)
+    builder.add_node("checkin",            checkin_node)
+    builder.add_node("tutor_qa_generate",  tutor_qa_generate_node)
+    builder.add_node("tutor_qa_answer",    tutor_qa_answer_node)
+    builder.add_node("tutor_qa_feedback",  tutor_qa_feedback_node)
+    builder.add_node("quiz_generate",      quiz_generate_node)
+    builder.add_node("quiz",               quiz_node)
+    builder.add_node("diary_writer",       diary_writer_node)
+    builder.add_node("diary_confirm",      diary_confirm_node)
+    builder.add_node("notion_post",        notion_post_node)
 
     # 진입점 분기 엣지
     builder.add_conditional_edges(
         START,
         route_entry,
-        {"checkin": "checkin_topic", "full": "mood_check"},
+        {"checkin": "checkin_topic", "full": "goal_check"},
     )
 
     # 목표 설정 경로
-    builder.add_edge("mood_check", "goal_check")
     builder.add_conditional_edges(
         "goal_check",
         route_after_goal_check,
-        {"setup": "goal_detail", "skip": "checkin"},
+        {"setup": "goal_detail", "skip": "checkin_topic"},
     )
-    builder.add_edge("goal_detail",     "domain_analysis")
-    builder.add_edge("domain_analysis", "curriculum_build")
+    builder.add_edge("goal_detail",      "curriculum_build")
     builder.add_edge("curriculum_build", "curriculum_confirm")
     builder.add_conditional_edges(
         "curriculum_confirm",
         route_after_curriculum_confirm,
         {"persona_build": "persona_build", "curriculum_build": "curriculum_build"},
     )
-    builder.add_edge("persona_build", "checkin_topic")
+    builder.add_edge("persona_build",  "checkin_topic")
 
-    # 체크인 경로
-    builder.add_edge("checkin_topic",    "checkin")
-    builder.add_edge("checkin",          "checkin_response")
-    builder.add_edge("checkin_response", "checkin_action")
+    # 체크인 → 튜터 Q&A → 퀴즈 → 일기
+    builder.add_edge("checkin_topic",     "checkin")
+    builder.add_edge("checkin",           "tutor_qa_generate")
+    builder.add_edge("tutor_qa_generate", "tutor_qa_answer")
+    builder.add_edge("tutor_qa_answer",   "tutor_qa_feedback")
     builder.add_conditional_edges(
-        "checkin_action",
-        route_after_checkin,
-        {
-            "resource_search": "resource_search",
-            "quiz_generate":   "quiz_generate",
-            "diary_writer":    "diary_writer",
-        },
-    )
-    builder.add_conditional_edges(
-        "resource_search",
-        route_after_resource_search,
-        {"quiz_generate": "quiz_generate", "diary_writer": "diary_writer"},
+        "tutor_qa_feedback",
+        route_tutor_qa,
+        {"tutor_qa_generate": "tutor_qa_generate", "quiz_generate": "quiz_generate"},
     )
     builder.add_edge("quiz_generate", "quiz")
-    builder.add_edge("quiz",          "diary_action")
-    builder.add_edge("diary_action",  "diary_writer")
+    builder.add_edge("quiz",          "diary_writer")
     builder.add_edge("diary_writer",  "diary_confirm")
     builder.add_edge("diary_confirm", "notion_post")
     builder.add_edge("notion_post",   END)

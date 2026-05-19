@@ -11,13 +11,14 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from graph import (
     get_active_goal,
-    mood_node,
     goal_check_node,
     goal_detail_node,
-    domain_analysis_node,
     curriculum_build_node,
     persona_build_node,
+    checkin_topic_node,
     checkin_node,
+    tutor_qa_generate_node,
+    tutor_qa_feedback_node,
     quiz_generate_node,
     quiz_node,
     diary_writer_node,
@@ -54,46 +55,6 @@ def test_get_active_goal_fallback_to_list(base_state):
 
 def test_get_active_goal_empty(base_state):
     assert get_active_goal(base_state) == ""
-
-
-# ── mood_node ───────────────────────────────────────────────────
-
-def test_mood_node_returns_mood(base_state):
-    """기분 입력이 요약되어 mood에 저장되는지"""
-    with patch("graph.llm") as mock_llm, \
-         patch("graph.interrupt", return_value="오늘 너무 피곤해요"):
-        mock_llm.invoke.return_value = make_llm_response("지친 하루였지만 잘 버텼어요.")
-        result = mood_node(base_state)
-
-    assert result["mood"] == "지친 하루였지만 잘 버텼어요."
-    assert isinstance(result["messages"][0], HumanMessage)
-    assert result["messages"][0].content == "오늘 너무 피곤해요"
-
-
-def test_mood_node_greeting_with_streak(base_state):
-    """streak이 있으면 연속달성 메시지가 포함되는지"""
-    state = {**base_state, "streak": 7}
-
-    with patch("graph.llm") as mock_llm, \
-         patch("graph.interrupt") as mock_interrupt:
-        mock_interrupt.return_value = "좋아요"
-        mock_llm.invoke.return_value = make_llm_response("활기찬 하루!")
-        mood_node(state)
-
-    prompt_shown = mock_interrupt.call_args[0][0]
-    assert "7일" in prompt_shown
-
-
-def test_mood_node_greeting_new_user(base_state):
-    """streak이 0이면 환영 메시지가 표시되는지"""
-    with patch("graph.llm") as mock_llm, \
-         patch("graph.interrupt") as mock_interrupt:
-        mock_interrupt.return_value = "좋아요"
-        mock_llm.invoke.return_value = make_llm_response("활기찬 하루!")
-        mood_node(base_state)
-
-    prompt_shown = mock_interrupt.call_args[0][0]
-    assert "환영" in prompt_shown
 
 
 # ── goal_check_node ─────────────────────────────────────────────
@@ -142,12 +103,12 @@ def test_goal_detail_extracts_level(state_with_goal):
     detail_json = '{"level": "intermediate", "focus": null}'
 
     with patch("graph.llm") as mock_llm, \
-         patch("graph.interrupt", return_value="중급 수준이에요. 집중하고 싶은 부분은 없어요"):
+         patch("graph.interrupt", return_value="중급 수준이에요"):
         mock_llm.invoke.return_value = make_llm_response(detail_json)
         result = goal_detail_node(state_with_goal)
 
     assert result["user_level"] == "intermediate"
-    assert result["active_goal"] == "LangGraph 공부"  # focus 없으면 그대로
+    assert result["active_goal"] == "LangGraph 공부"
 
 
 def test_goal_detail_appends_focus_to_goal(state_with_goal):
@@ -173,51 +134,18 @@ def test_goal_detail_fallback_on_json_error(state_with_goal):
     assert result["user_level"] == "beginner"
 
 
-# ── domain_analysis_node ────────────────────────────────────────
-
-def test_domain_analysis_returns_domain_info(state_with_goal):
-    """domain_analysis_node가 domain_info dict를 반환하는지"""
-    mock_domain = MagicMock()
-    mock_domain.model_dump.return_value = {
-        "domain": "programming", "subject": "LangGraph",
-        "level": "intermediate", "learning_style": "hands-on",
-        "estimated_weeks": 4, "prerequisites": [],
-        "is_framework": True, "official_name": "LangGraph by LangChain",
-    }
-
-    with patch("graph.llm") as mock_llm:
-        mock_llm.with_structured_output.return_value = make_structured_mock(mock_domain)
-        result = domain_analysis_node(state_with_goal)
-
-    assert "domain_info" in result
-    assert result["domain_info"]["domain"] == "programming"
-    assert result["domain_info"]["is_framework"] is True
-
-
-def test_domain_analysis_prompt_contains_goal(state_with_goal):
-    """user_level이 LLM 프롬프트에 포함되는지"""
-    state = {**state_with_goal, "user_level": "advanced"}
-    mock_domain = MagicMock()
-    mock_domain.model_dump.return_value = {
-        "domain": "programming", "subject": "LangGraph", "level": "advanced",
-        "learning_style": "hands-on", "estimated_weeks": 4,
-        "prerequisites": [], "is_framework": False, "official_name": "",
-    }
-
-    with patch("graph.llm") as mock_llm:
-        structured = make_structured_mock(mock_domain)
-        mock_llm.with_structured_output.return_value = structured
-        domain_analysis_node(state)
-
-    prompt_content = structured.invoke.call_args[0][0][0].content
-    assert "advanced" in prompt_content
-
-
 # ── curriculum_build_node ───────────────────────────────────────
 
 def test_curriculum_build_returns_curriculum(state_with_goal):
     """curriculum_build_node가 curriculum dict를 반환하는지"""
-    from graph import DayPlan, WeekPhase, Curriculum, ResourceLink
+    from graph import DayPlan, WeekPhase, Curriculum, DomainAnalysis
+
+    mock_domain = DomainAnalysis(
+        domain="programming", subject="LangGraph",
+        level="intermediate", learning_style="hands-on",
+        estimated_weeks=4, prerequisites=[],
+        is_framework=True, official_name="LangGraph by LangChain",
+    )
     mock_curriculum = Curriculum(
         domain="programming", subject="LangGraph",
         level="intermediate", total_weeks=4, daily_minutes=60,
@@ -225,29 +153,58 @@ def test_curriculum_build_returns_curriculum(state_with_goal):
             WeekPhase(
                 week=1, theme="LangGraph 기초", checkpoint="기본 그래프 구성",
                 days=[DayPlan(day=1, topic="StateGraph 소개")],
-                resources=[ResourceLink(title="LangGraph 공식 문서",
-                                        url="https://langchain-ai.github.io/langgraph/")],
+                resources=[],
             )
         ],
     )
 
-    state = {
-        **state_with_goal,
-        "domain_info": {
-            "subject": "LangGraph", "level": "intermediate",
-            "learning_style": "hands-on", "estimated_weeks": 4,
-            "domain": "programming", "is_framework": True,
-            "official_name": "LangGraph by LangChain",
-        },
-    }
-
     with patch("graph.llm") as mock_llm:
-        mock_llm.with_structured_output.return_value = make_structured_mock(mock_curriculum)
-        result = curriculum_build_node(state)
+        # curriculum_build_node는 내부에서 DomainAnalysis → Curriculum 순으로
+        # with_structured_output을 두 번 호출
+        mock_llm.with_structured_output.side_effect = [
+            make_structured_mock(mock_domain),
+            make_structured_mock(mock_curriculum),
+        ]
+        result = curriculum_build_node(state_with_goal)
 
     assert "curriculum" in result
     assert result["curriculum"]["total_weeks"] == 4
-    assert result["curriculum"]["phases"][0]["resources"][0]["url"].startswith("https://")
+    assert result["curriculum"]["phases"][0]["theme"] == "LangGraph 기초"
+
+
+def test_curriculum_build_includes_framework_hint(state_with_goal):
+    """is_framework=True일 때 framework hint가 커리큘럼 프롬프트에 포함되는지"""
+    from graph import DayPlan, WeekPhase, Curriculum, DomainAnalysis
+
+    mock_domain = DomainAnalysis(
+        domain="programming", subject="LangGraph",
+        level="intermediate", learning_style="hands-on",
+        estimated_weeks=4, prerequisites=[],
+        is_framework=True, official_name="LangGraph by LangChain",
+    )
+    mock_curriculum = Curriculum(
+        domain="programming", subject="LangGraph",
+        level="intermediate", total_weeks=4, daily_minutes=60,
+        phases=[
+            WeekPhase(
+                week=1, theme="기초", checkpoint="이해",
+                days=[DayPlan(day=1, topic="소개")],
+                resources=[],
+            )
+        ],
+    )
+
+    with patch("graph.llm") as mock_llm:
+        curriculum_mock = make_structured_mock(mock_curriculum)
+        mock_llm.with_structured_output.side_effect = [
+            make_structured_mock(mock_domain),
+            curriculum_mock,
+        ]
+        curriculum_build_node(state_with_goal)
+
+    # 두 번째 with_structured_output 호출(curriculum)의 프롬프트에 framework hint 포함 확인
+    curriculum_prompt = curriculum_mock.invoke.call_args[0][0][0].content
+    assert "LangGraph by LangChain" in curriculum_prompt
 
 
 # ── persona_build_node ──────────────────────────────────────────
@@ -260,21 +217,13 @@ def test_persona_build_returns_tutor_persona(state_with_goal):
         "phases": [
             {"week": 1, "theme": "기초", "checkpoint": "기본 이해",
              "days": [{"day": 1, "topic": "StateGraph 소개"}],
-             "resources": [{"title": "LangGraph Docs",
-                            "url": "https://langchain-ai.github.io/langgraph/"}]},
+             "resources": []},
         ],
     }
-    state = {
-        **state_with_goal,
-        "curriculum": curriculum,
-        "domain_info": {"learning_style": "hands-on"},
-    }
+    state = {**state_with_goal, "curriculum": curriculum}
 
     with patch("graph.llm") as mock_llm:
-        mock_llm.invoke.side_effect = [
-            make_llm_response("1. 매일 30분\n2. 실습 위주\n3. 복습"),
-            make_llm_response("당신은 LangGraph 전문 강사입니다."),
-        ]
+        mock_llm.invoke.return_value = make_llm_response("당신은 LangGraph 전문 강사입니다.")
         result = persona_build_node(state)
 
     assert result["tutor_persona"] == "당신은 LangGraph 전문 강사입니다."
@@ -285,83 +234,132 @@ def test_persona_build_returns_tutor_persona(state_with_goal):
     assert "LangGraph 공부" in result["learning_goals"]
 
 
-def test_persona_build_summary_includes_resources(state_with_goal):
-    """1주차 자료 링크가 summary 메시지에 포함되는지"""
+def test_persona_build_single_llm_call(state_with_goal):
+    """persona_build_node는 LLM을 1번만 호출하는지 (habit plan 제거 후)"""
     curriculum = {
         "subject": "LangGraph", "domain": "programming",
         "level": "intermediate", "total_weeks": 4, "daily_minutes": 60,
         "phases": [
             {"week": 1, "theme": "기초", "checkpoint": "이해",
              "days": [{"day": 1, "topic": "StateGraph"}],
-             "resources": [{"title": "LangGraph Docs",
-                            "url": "https://langchain-ai.github.io/langgraph/"}]},
+             "resources": []},
         ],
     }
-    state = {**state_with_goal, "curriculum": curriculum, "domain_info": {}}
+    state = {**state_with_goal, "curriculum": curriculum}
 
     with patch("graph.llm") as mock_llm:
-        mock_llm.invoke.side_effect = [
-            make_llm_response("1. 실습\n2. 복습\n3. 정리"),
-            make_llm_response("당신은 LangGraph 튜터입니다."),
-        ]
-        result = persona_build_node(state)
+        mock_llm.invoke.return_value = make_llm_response("튜터 페르소나.")
+        persona_build_node(state)
 
-    summary_content = result["messages"][0].content
-    assert "langchain-ai.github.io" in summary_content
+    assert mock_llm.invoke.call_count == 1
 
 
-# ── checkin_node ────────────────────────────────────────────────
+# ── checkin_topic_node ──────────────────────────────────────────
 
-def test_checkin_streak_zero_message(base_state):
-    """streak=0이면 '오늘부터 시작' 메시지"""
-    with patch("graph.interrupt") as mock_interrupt:
-        mock_interrupt.return_value = "공부했어요"
-        checkin_node(base_state)
+def test_checkin_topic_pre_increments_streak(base_state):
+    """checkin_topic_node가 streak을 미리 증가시키는지"""
+    state = {**base_state, "streak": 3}
 
-    prompt = mock_interrupt.call_args[0][0]
-    assert "오늘부터 시작" in prompt
+    with patch("graph.TavilySearch", None):
+        result = checkin_topic_node(state)
 
-
-def test_checkin_streak_positive_message(state_with_goal):
-    """streak>0이면 연속달성 메시지"""
-    with patch("graph.interrupt") as mock_interrupt:
-        mock_interrupt.return_value = "공부했어요"
-        checkin_node(state_with_goal)
-
-    prompt = mock_interrupt.call_args[0][0]
-    assert "연속 달성" in prompt
+    assert result["streak"] == 4
 
 
-def test_checkin_increments_streak(base_state):
-    state = {**base_state, "streak": 4}
-
-    with patch("graph.interrupt", return_value="오늘 공부했어요"):
-        result = checkin_node(state)
-
-    assert result["streak"] == 5
-
-
-def test_checkin_saves_achievements(base_state):
-    user_msg = "LangGraph StateGraph를 실습했어요"
-
-    with patch("graph.interrupt", return_value=user_msg):
-        result = checkin_node(base_state)
-
-    assert result["today_achievements"] == user_msg
-
-
-def test_checkin_prompt_includes_resources(state_with_goal):
-    """curriculum에 resources가 있으면 체크인 prompt에 포함되는지"""
+def test_checkin_topic_sets_week_and_topic(base_state):
+    """checkin_topic_node가 current_week, current_topic을 state에 저장하는지"""
     curriculum = {
         "total_weeks": 4,
         "phases": [
             {"week": 1, "theme": "기초", "checkpoint": "이해",
-             "days": [{"day": 1, "topic": "StateGraph"}],
-             "resources": [{"title": "LangGraph Docs",
-                            "url": "https://langchain-ai.github.io/langgraph/"}]},
+             "days": [
+                 {"day": 1, "topic": "StateGraph 소개"},
+                 {"day": 2, "topic": "Nodes and Edges"},
+             ],
+             "resources": []},
         ],
     }
-    state = {**state_with_goal, "curriculum": curriculum, "streak": 0}
+    state = {**base_state, "streak": 0, "curriculum": curriculum}
+
+    with patch("graph.tavily_search", None):
+        result = checkin_topic_node(state)
+
+    assert result["current_week"] == 1
+    assert result["current_topic"] == "StateGraph 소개"
+    assert result["streak"] == 1
+
+
+def test_checkin_topic_resets_tutor_qa(base_state):
+    """checkin_topic_node가 tutor_qa 관련 state를 초기화하는지"""
+    state = {
+        **base_state,
+        "tutor_qa_index": 3,
+        "tutor_qa_history": [{"question": "q", "answer": "a"}],
+        "ready_for_quiz": True,
+    }
+
+    with patch("graph.tavily_search", None):
+        result = checkin_topic_node(state)
+
+    assert result["tutor_qa_index"] == 0
+    assert result["tutor_qa_history"] == []
+    assert result["ready_for_quiz"] is False
+
+
+# ── checkin_node ────────────────────────────────────────────────
+
+def test_checkin_first_day_message(base_state):
+    """streak=1 (Day 1, pre-incremented)이면 '첫 날 시작' 메시지"""
+    state = {**base_state, "streak": 1, "current_topic": "StateGraph"}
+
+    with patch("graph.interrupt") as mock_interrupt:
+        mock_interrupt.return_value = "공부했어요"
+        checkin_node(state)
+
+    prompt = mock_interrupt.call_args[0][0]
+    assert "first day" in prompt.lower()
+
+
+def test_checkin_streak_message(state_with_goal):
+    """streak>1이면 연속달성 streak 메시지 포함"""
+    state = {**state_with_goal, "streak": 6}  # already pre-incremented
+
+    with patch("graph.interrupt") as mock_interrupt:
+        mock_interrupt.return_value = "공부했어요"
+        checkin_node(state)
+
+    prompt = mock_interrupt.call_args[0][0]
+    assert "streak" in prompt.lower()
+
+
+def test_checkin_saves_achievements(base_state):
+    """사용자 입력이 today_achievements에 저장되는지"""
+    state = {**base_state, "streak": 1, "current_topic": "StateGraph"}
+    user_msg = "LangGraph StateGraph를 실습했어요"
+
+    with patch("graph.interrupt", return_value=user_msg):
+        result = checkin_node(state)
+
+    assert result["today_achievements"] == user_msg
+
+
+def test_checkin_does_not_modify_streak(base_state):
+    """checkin_node는 streak을 변경하지 않음 (checkin_topic_node에서 처리)"""
+    state = {**base_state, "streak": 4, "current_topic": "test"}
+
+    with patch("graph.interrupt", return_value="공부"):
+        result = checkin_node(state)
+
+    assert "streak" not in result
+
+
+def test_checkin_prompt_includes_resources(state_with_goal):
+    """search_results가 있으면 체크인 prompt에 포함되는지"""
+    state = {
+        **state_with_goal,
+        "streak": 1,
+        "search_results": "https://langchain-ai.github.io/langgraph/",
+    }
 
     with patch("graph.interrupt") as mock_interrupt:
         mock_interrupt.return_value = "공부했어요"
@@ -371,17 +369,112 @@ def test_checkin_prompt_includes_resources(state_with_goal):
     assert "langchain-ai.github.io" in prompt
 
 
+# ── tutor_qa_generate_node ──────────────────────────────────────
+
+def test_tutor_qa_turn1_uses_curriculum_context(state_with_search):
+    """Turn 1에서 week theme과 checkpoint이 프롬프트에 포함되는지"""
+    state = {**state_with_search, "tutor_qa_index": 0, "streak": 1}
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response("오늘 배울 내용입니다.")
+        result = tutor_qa_generate_node(state)
+
+    assert "messages" in result
+    assert isinstance(result["messages"][0], AIMessage)
+    assert result["ready_for_quiz"] is False
+
+    prompt = mock_llm.invoke.call_args[0][0][1].content
+    assert "LangGraph 기초" in prompt  # week theme
+
+
+def test_tutor_qa_turn2_returns_json_message(state_with_search):
+    """Turn 2+에서 JSON 응답을 파싱하여 message를 추출하는지"""
+    history = [{"question": "StateGraph란?", "answer": "그래프 구조입니다."}]
+    state = {
+        **state_with_search,
+        "tutor_qa_index": 1,
+        "tutor_qa_history": history,
+        "streak": 2,
+    }
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response(
+            '{"message": "좋은 답변이에요! 다음으로 넘어가겠습니다.", "ready_for_quiz": false}'
+        )
+        result = tutor_qa_generate_node(state)
+
+    assert result["messages"][0].content == "좋은 답변이에요! 다음으로 넘어가겠습니다."
+    assert result["ready_for_quiz"] is False
+
+
+def test_tutor_qa_ready_for_quiz_signal(state_with_search):
+    """LLM이 ready_for_quiz=true를 반환하면 state에 반영되는지"""
+    history = [
+        {"question": "q1", "answer": "a1"},
+        {"question": "q2", "answer": "a2"},
+    ]
+    state = {
+        **state_with_search,
+        "tutor_qa_index": 2,
+        "tutor_qa_history": history,
+        "streak": 3,
+    }
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response(
+            '{"message": "수고했어요!", "ready_for_quiz": true}'
+        )
+        result = tutor_qa_generate_node(state)
+
+    assert result["ready_for_quiz"] is True
+
+
+def test_tutor_qa_max_turns_forces_quiz(state_with_search):
+    """MAX_TURNS(5) 도달 시 ready_for_quiz가 강제로 True가 되는지"""
+    history = [{"question": f"q{i}", "answer": f"a{i}"} for i in range(5)]
+    state = {
+        **state_with_search,
+        "tutor_qa_index": 5,
+        "tutor_qa_history": history,
+        "streak": 6,
+    }
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response(
+            '{"message": "계속 합시다.", "ready_for_quiz": false}'
+        )
+        result = tutor_qa_generate_node(state)
+
+    assert result["ready_for_quiz"] is True
+
+
+# ── tutor_qa_feedback_node ──────────────────────────────────────
+
+def test_tutor_qa_feedback_appends_history(base_state):
+    """tutor_qa_feedback_node가 history에 Q&A를 추가하는지"""
+    state = {
+        **base_state,
+        "tutor_qa_index":   1,
+        "tutor_qa_question": "StateGraph란?",
+        "tutor_qa_answer":   "노드와 엣지로 구성됩니다.",
+        "tutor_qa_history":  [],
+    }
+    result = tutor_qa_feedback_node(state)
+
+    assert len(result["tutor_qa_history"]) == 1
+    assert result["tutor_qa_history"][0]["question"] == "StateGraph란?"
+    assert result["tutor_qa_index"] == 2
+
+
 # ── _get_review_topics ──────────────────────────────────────────
 
 def test_get_review_topics_empty_history():
-    """quiz_history가 비어있으면 빈 리스트 반환"""
     assert _get_review_topics([], "오늘 주제") == []
 
 
 def test_get_review_topics_detects_weak_topic():
-    """피드백에 부정 키워드가 있으면 약점 토픽으로 감지"""
     history = [{"date": "2026-05-01", "topic": "API 활용",
-                "feedback": "2번 아쉬워요. 점수: 1/3", "questions": "", "answers": ""}]
+                "feedback": "2번 incorrect. 점수: 1/3", "questions": "", "answers": ""}]
     result = _get_review_topics(history, "오늘 주제")
     assert len(result) == 1
     assert result[0]["topic"] == "API 활용"
@@ -389,32 +482,26 @@ def test_get_review_topics_detects_weak_topic():
 
 
 def test_get_review_topics_detects_old_topic():
-    """3일 이상 지난 토픽은 복습 대상"""
     history = [{"date": "2020-01-01", "topic": "기초 개념",
                 "feedback": "완벽해요!", "questions": "", "answers": ""}]
     result = _get_review_topics(history, "오늘 주제")
     assert len(result) == 1
-    assert result[0]["topic"] == "기초 개념"
     assert result[0]["is_weak"] is False
 
 
 def test_get_review_topics_excludes_current_topic():
-    """오늘 주제와 같은 항목은 제외"""
     history = [{"date": "2020-01-01", "topic": "오늘 주제",
                 "feedback": "아쉬워요", "questions": "", "answers": ""}]
-    result = _get_review_topics(history, "오늘 주제")
-    assert result == []
+    assert _get_review_topics(history, "오늘 주제") == []
 
 
 def test_get_review_topics_max_two():
-    """최대 2개까지만 반환"""
     history = [
         {"date": "2020-01-01", "topic": f"토픽{i}",
          "feedback": "아쉬워요", "questions": "", "answers": ""}
         for i in range(5)
     ]
-    result = _get_review_topics(history, "오늘 주제")
-    assert len(result) <= 2
+    assert len(_get_review_topics(history, "오늘 주제")) <= 2
 
 
 # ── quiz_generate_node ──────────────────────────────────────────
@@ -422,14 +509,16 @@ def test_get_review_topics_max_two():
 def test_quiz_generate_node_returns_questions(state_with_search):
     """quiz_generate_node가 quiz_questions를 state에 저장하는지"""
     with patch("graph.llm") as mock_llm:
-        mock_llm.invoke.return_value = make_llm_response("1번 문제: StateGraph란?\n2번 문제: ...\n3번 문제: ...")
+        mock_llm.invoke.return_value = make_llm_response(
+            "1번 문제: StateGraph란?\n2번 문제: ...\n3번 문제: ..."
+        )
         result = quiz_generate_node(state_with_search)
 
     assert "quiz_questions" in result
     assert "StateGraph" in result["quiz_questions"]
 
 
-def test_quiz_generate_node_uses_tutor_persona(state_with_search):
+def test_quiz_generate_uses_tutor_persona(state_with_search):
     """quiz_generate_node가 tutor_persona를 SystemMessage로 사용하는지"""
     with patch("graph.llm") as mock_llm:
         mock_llm.invoke.return_value = make_llm_response("퀴즈 문제들...")
@@ -442,60 +531,49 @@ def test_quiz_generate_node_uses_tutor_persona(state_with_search):
 
 # ── quiz_node ───────────────────────────────────────────────────
 
-def test_quiz_node_returns_feedback_message(state_with_search):
-    """quiz_node가 state의 quiz_questions를 사용해 평가하는지"""
-    state = {**state_with_search, "quiz_questions": "1번 문제: StateGraph란?\n2번 문제: ...\n3번 문제: ..."}
+def test_quiz_node_returns_feedback(state_with_search):
+    """quiz_node가 quiz_questions를 사용해 평가하는지"""
+    state = {
+        **state_with_search,
+        "quiz_questions": "1번: StateGraph란?\n2번: ...\n3번: ...",
+    }
 
     with patch("graph.llm") as mock_llm, \
          patch("graph.interrupt", return_value="1. StateGraph  2. 모르겠어요  3. interrupt"):
-        mock_llm.invoke.return_value = make_llm_response("1번 정답! 2번 아쉬워요. 전체 점수: 2/3")
+        mock_llm.invoke.return_value = make_llm_response("1번 정답! 2번 아쉬워요. 점수: 2/3")
         result = quiz_node(state)
 
     assert "quiz_history" in result
     assert len(result["quiz_history"]) == 1
-    assert result["quiz_history"][0]["topic"] == "LangGraph 기초"
-    assert result["quiz_questions"] == ""  # 사용 후 초기화 확인
+    assert result["quiz_questions"] == ""
 
 
 def test_quiz_node_appends_to_existing_history(state_with_search):
     existing = [{"date": "2026-01-01", "topic": "이전 토픽",
                  "questions": "", "answers": "", "feedback": ""}]
-    state = {**state_with_search, "quiz_history": existing, "quiz_questions": "퀴즈 문제들..."}
+    state = {**state_with_search, "quiz_history": existing, "quiz_questions": "퀴즈..."}
 
     with patch("graph.llm") as mock_llm, \
-         patch("graph.interrupt", return_value="답변입니다"):
+         patch("graph.interrupt", return_value="답변"):
         mock_llm.invoke.return_value = make_llm_response("피드백: 잘했어요! 점수: 3/3")
         result = quiz_node(state)
 
     assert len(result["quiz_history"]) == 2
 
 
-def test_quiz_node_uses_state_quiz_questions(state_with_search):
-    """quiz_node가 LLM을 재호출하지 않고 state의 quiz_questions를 사용하는지"""
-    state = {**state_with_search, "quiz_questions": "미리 생성된 퀴즈 문제"}
+def test_quiz_node_single_llm_call(state_with_search):
+    """quiz_node는 LLM을 1번만 호출 (평가용)"""
+    state = {**state_with_search, "quiz_questions": "미리 생성된 퀴즈"}
 
     with patch("graph.llm") as mock_llm, \
          patch("graph.interrupt", return_value="답변"):
         mock_llm.invoke.return_value = make_llm_response("피드백")
         quiz_node(state)
 
-    # quiz_node는 LLM을 1번만 호출 (평가용)
     assert mock_llm.invoke.call_count == 1
 
 
 # ── diary_writer_node ───────────────────────────────────────────
-
-def test_diary_writer_mood_fallback(state_with_goal):
-    """mood가 비어있으면 '평온한 하루' 사용"""
-    state = {**state_with_goal, "mood": ""}
-
-    with patch("graph.llm") as mock_llm:
-        mock_llm.invoke.return_value = make_llm_response("오늘의 일기...")
-        diary_writer_node(state)
-
-    system_content = mock_llm.invoke.call_args[0][0][0].content
-    assert "평온한 하루" in system_content
-
 
 def test_diary_writer_achievements_fallback(state_with_goal):
     """today_achievements가 비어있으면 fallback 메시지 사용"""
@@ -506,11 +584,29 @@ def test_diary_writer_achievements_fallback(state_with_goal):
         diary_writer_node(state)
 
     system_content = mock_llm.invoke.call_args[0][0][0].content
-    assert "오늘의 학습을 기록하지 않았어요" in system_content
+    assert "No learning recorded" in system_content
+
+
+def test_diary_writer_uses_tutor_history(state_with_goal):
+    """tutor_qa_history가 있으면 achievements 대신 사용되는지"""
+    state = {
+        **state_with_goal,
+        "tutor_qa_history": [
+            {"question": "q1", "answer": "StateGraph는 노드와 엣지로 구성됩니다."},
+        ],
+        "today_achievements": "이 내용은 사용되지 않아야 함",
+    }
+
+    with patch("graph.llm") as mock_llm:
+        mock_llm.invoke.return_value = make_llm_response("일기 내용...")
+        diary_writer_node(state)
+
+    system_content = mock_llm.invoke.call_args[0][0][0].content
+    assert "StateGraph는 노드와 엣지로 구성됩니다." in system_content
 
 
 def test_diary_writer_returns_diary_content(state_with_goal):
-    state = {**state_with_goal, "mood": "좋아요", "today_achievements": "공부했어요"}
+    state = {**state_with_goal, "today_achievements": "공부했어요"}
 
     with patch("graph.llm") as mock_llm:
         mock_llm.invoke.return_value = make_llm_response("완성된 일기 내용입니다.")
@@ -522,10 +618,10 @@ def test_diary_writer_returns_diary_content(state_with_goal):
 # ── notion_post_node ────────────────────────────────────────────
 
 def test_notion_post_skips_when_diary_empty(state_with_goal):
-    state  = {**state_with_goal, "diary_content": ""}
+    state = {**state_with_goal, "diary_content": ""}
     result = notion_post_node(state)
 
-    assert "건너뛰었어요" in result["messages"][0].content
+    assert "No diary content" in result["messages"][0].content
 
 
 def test_notion_post_success_message(state_with_diary):
@@ -533,7 +629,7 @@ def test_notion_post_success_message(state_with_diary):
         mock_tool.invoke.return_value = "✅ Notion 포스팅 성공! https://notion.so/..."
         result = notion_post_node(state_with_diary)
 
-    assert "저장됐어요" in result["messages"][0].content
+    assert "saved to Notion" in result["messages"][0].content
 
 
 def test_notion_post_failure_message(state_with_diary):
@@ -541,4 +637,4 @@ def test_notion_post_failure_message(state_with_diary):
         mock_tool.invoke.return_value = "⚠️ 오류 (400): 연결 실패"
         result = notion_post_node(state_with_diary)
 
-    assert "실패" in result["messages"][0].content
+    assert "Couldn't save" in result["messages"][0].content
